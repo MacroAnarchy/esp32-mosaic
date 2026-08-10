@@ -19,6 +19,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <NimBLEDevice.h>
+#include <esp_wifi.h>   // promiscuous mode APIs (passive sniffing)
 #include <vector>
 #include <string>
 
@@ -41,6 +42,28 @@
 #ifndef MOSAIC_SCAN_INTERVAL
 #define MOSAIC_SCAN_INTERVAL 10000
 #endif
+
+// WiFi offline scan cycle (see docs/spec-wifi-scan.md):
+// drop WiFi -> promiscuous -> hop ch 1..13 -> capture beacons/probes ->
+// reconnect -> report as one type:"wifi" batch envelope.
+#ifndef MOSAIC_WIFI_SCAN_ENABLE
+#define MOSAIC_WIFI_SCAN_ENABLE 1
+#endif
+#ifndef MOSAIC_WIFI_SCAN_INTERVAL_SECONDS
+#define MOSAIC_WIFI_SCAN_INTERVAL_SECONDS 300   // every 5 min by default
+#endif
+#ifndef MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS
+#define MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS 80     // per-channel listen time
+#endif
+#ifndef MOSAIC_WIFI_RECONNECT_TIMEOUT_MS
+#define MOSAIC_WIFI_RECONNECT_TIMEOUT_MS 15000  // join timeout per attempt
+#endif
+#ifndef MOSAIC_WIFI_RECONNECT_RETRIES
+#define MOSAIC_WIFI_RECONNECT_RETRIES 3         // full join attempts
+#endif
+#define WIFI_SCAN_MAX_FRAMES 64                 // batch cap per cycle
+#define WIFI_SCAN_MAX_CHANNEL 13                // 2.4GHz channels 1..13
+#define WIFI_SSID_MAX_LEN 33                    // 32 + NUL
 
 // WiFi credentials: legacy MOSAIC_* names, with MOSAIC_* fallback so a config.h
 // copied straight from config.example.h compiles too.
@@ -248,6 +271,191 @@ static String recordToJson(const DeviceRecord& rec) {
 const char* gatewayHost = MOSAIC_GATEWAY_HOST;
 const int gatewayPort = MOSAIC_GATEWAY_PORT;
 
+// =====================================================================
+// WiFi offline scan cycle ("the mosaic goes offline to see")
+// ---------------------------------------------------------------------
+// The ESP32 has ONE radio: while associated to WiFi it is blind to the
+// rest of the spectrum. Every MOSAIC_WIFI_SCAN_INTERVAL_SECONDS we drop
+// the association, enter promiscuous mode, hop channels 1..13 (~80ms
+// each), capture 802.11 beacons (0x80) + probe requests (0x40) — PASSIVE
+// listen only — then reconnect and report the batch as one envelope.
+// Ported (passive parts) from ESP32Marauder's WiFiScan.cpp:
+//   beaconSnifferCallback (~line 8024) + setWiFiMode (~line 3297).
+// =====================================================================
+
+struct WifiFrame {
+  String kind;        // "beacon" | "probe_req"
+  String mac;         // src MAC (AP for beacon, client for probe)
+  String bssid;       // beacon: the AP BSSID; probe: empty
+  String ssid;        // beacon: broadcast name / probe: requested SSID
+  uint8_t channel;
+  int8_t rssi;
+};
+
+static WifiFrame g_wifiFrames[WIFI_SCAN_MAX_FRAMES];
+static uint8_t g_wifiFrameCount = 0;
+static volatile bool g_wifiScanActive = false;
+
+// Format a 6-byte MAC as "aa:bb:cc:dd:ee:ff"
+static void macToString(const uint8_t* mac, char* out, size_t outLen) {
+  snprintf(out, outLen, "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// Promiscuous RX callback — runs on the WiFi task, keep it fast.
+// Parses management frames only: 0x80 = beacon, 0x40 = probe request.
+static void wifiPromiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;               // mgmt frames only
+  if (!g_wifiScanActive) return;
+  if (g_wifiFrameCount >= WIFI_SCAN_MAX_FRAMES) return;
+
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* payload = pkt->payload;
+  if (payload[0] != 0x80 && payload[0] != 0x40) return;  // beacon / probe req
+
+  // Sanity: frame must at least reach the ESSID length bytes
+  if (pkt->rx_ctrl.sig_len < 40) return;
+
+  WifiFrame fr;
+  char macBuf[18];
+  fr.channel = pkt->rx_ctrl.channel;
+  fr.rssi = pkt->rx_ctrl.rssi;
+
+  // src MAC at payload[10..15], dst at [4..9]
+  macToString(&payload[10], macBuf, sizeof(macBuf));
+  fr.mac = String(macBuf);
+
+  if (payload[0] == 0x80) {
+    // Beacon: AP advertising — BSSID == src MAC; ESSID len at payload[37],
+    // name at payload[38..38+len]
+    fr.kind = "beacon";
+    macToString(&payload[10], macBuf, sizeof(macBuf));  // BSSID == src for beacons
+    fr.bssid = String(macBuf);
+    uint8_t essidLen = payload[37];
+    if (essidLen > 32) essidLen = 32;
+    if (essidLen > 0) {
+      String s;
+      for (uint8_t i = 0; i < essidLen; i++) {
+        char c = (char)payload[38 + i];
+        s += (c >= 0x20 && c <= 0x7E) ? c : '?';  // printable only
+      }
+      fr.ssid = s;
+    }
+  } else {
+    // Probe request: client seeking — requested SSID len at payload[25],
+    // name at payload[26..26+len]; BSSID field is empty (we don't chase it)
+    fr.kind = "probe_req";
+    fr.bssid = "";
+    uint8_t essidLen = payload[25];
+    if (essidLen > 32) essidLen = 32;
+    if (essidLen > 0) {
+      String s;
+      for (uint8_t i = 0; i < essidLen; i++) {
+        char c = (char)payload[26 + i];
+        s += (c >= 0x20 && c <= 0x7E) ? c : '?';
+      }
+      fr.ssid = s;
+    }
+  }
+
+  // Dedup within the cycle: same kind + mac + ssid => keep the stronger RSSI
+  for (uint8_t i = 0; i < g_wifiFrameCount; i++) {
+    WifiFrame& e = g_wifiFrames[i];
+    if (e.kind == fr.kind && e.mac == fr.mac && e.ssid == fr.ssid) {
+      if (fr.rssi > e.rssi) e.rssi = fr.rssi;
+      return;
+    }
+  }
+  g_wifiFrames[g_wifiFrameCount++] = fr;
+}
+
+// Set channel (Marauder changeChannel() equivalent)
+static void wifiSetChannel(uint8_t ch) {
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+}
+
+// Blocking WiFi join with timeout; returns true when connected.
+static bool wifiJoin(const char* ssid, const char* pass) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > MOSAIC_WIFI_RECONNECT_TIMEOUT_MS) {
+      Serial.println("  join timeout");
+      return false;
+    }
+    delay(300);
+  }
+  return true;
+}
+
+// One offline scan cycle. Assumes caller holds no other radio activity.
+static void runWifiScanCycle() {
+  Serial.printf("--- WiFi offline scan (%ds interval) ---\n",
+                MOSAIC_WIFI_SCAN_INTERVAL_SECONDS);
+
+  g_wifiFrameCount = 0;
+  g_wifiScanActive = true;
+
+  // 1) Drop association, go NULL, enter promiscuous (Marauder setWiFiMode)
+  WiFi.disconnect();
+  esp_wifi_set_mode(WIFI_MODE_NULL);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(wifiPromiscuousCallback);
+
+  // 2) Hop channels 1..13, holding each ~80ms (~1s total)
+  for (uint8_t ch = 1; ch <= WIFI_SCAN_MAX_CHANNEL; ch++) {
+    wifiSetChannel(ch);
+    delay(MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS);
+  }
+
+  // 3) Exit promiscuous, back to STA
+  esp_wifi_set_promiscuous(false);
+  g_wifiScanActive = false;
+  WiFi.mode(WIFI_STA);
+
+  // 4) Reconnect with retry loop — a node that can't rejoin is dead.
+  //    If join fails we KEEP retrying (outer loop also retries) while the
+  //    rest of the sensing cycle (BLE) keeps collecting.
+  bool joined = false;
+  for (int attempt = 1; attempt <= MOSAIC_WIFI_RECONNECT_RETRIES && !joined; attempt++) {
+    Serial.printf("  reconnect attempt %d/%d...\n", attempt, MOSAIC_WIFI_RECONNECT_RETRIES);
+    joined = wifiJoin(MOSAIC_WIFI_SSID, MOSAIC_WIFI_PASSWORD);
+  }
+  if (joined) {
+    Serial.printf("  reconnected. IP: %s BSSID: %s\n",
+                  WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str());
+  } else {
+    Serial.println("  reconnect FAILED — will keep retrying on next cycle");
+  }
+
+  // 5) Report the batch envelope (only if back online and frames captured)
+  if (joined && g_wifiFrameCount > 0) {
+    HTTPClient http;
+    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
+    String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) +
+                     "\",\"type\":\"wifi\",\"ts\":" + String(millis()) +
+                     ",\"payload\":{\"frames\":[";
+    for (uint8_t i = 0; i < g_wifiFrameCount; i++) {
+      if (i > 0) payload += ",";
+      const WifiFrame& fr = g_wifiFrames[i];
+      payload += "{\"kind\":\"" + fr.kind + "\",\"mac\":\"" + fr.mac + "\"";
+      if (fr.bssid.length() > 0) payload += ",\"bssid\":\"" + fr.bssid + "\"";
+      if (fr.ssid.length() > 0) payload += ",\"ssid\":\"" + jsonEscape(fr.ssid) + "\"";
+      payload += ",\"channel\":" + String(fr.channel) +
+                 ",\"rssi\":" + String(fr.rssi) + "}";
+    }
+    payload += "]}}";
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(payload);
+    Serial.printf("  wifi batch POST: %d (%d frames)\n", httpCode, g_wifiFrameCount);
+    http.end();
+  }
+  g_wifiFrameCount = 0;
+}
+
 // ORB protocol v1 — location is LEARNED, not claimed.
 // The firmware reports the real BSSID of the AP it's connected to;
 // the brain maps BSSID → label ("home", "gym", ...). See docs/protocol.md.
@@ -312,6 +520,27 @@ void loop() {
     Serial.printf("Gateway POST: %d\n", httpCode);
     http.end();
   }
+
+#if MOSAIC_WIFI_SCAN_ENABLE
+  // WiFi offline scan cycle — sequential with BLE (one radio, phases never
+  // overlap). Every MOSAIC_WIFI_SCAN_INTERVAL_SECONDS: drop WiFi, sniff
+  // channels 1..13, reconnect, report the batch.
+  static unsigned long lastWifiScanMs = 0;
+  unsigned long now = millis();
+  if (lastWifiScanMs == 0 ||
+      (now - lastWifiScanMs) >= (unsigned long)MOSAIC_WIFI_SCAN_INTERVAL_SECONDS * 1000UL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      runWifiScanCycle();
+      lastWifiScanMs = millis();
+    } else {
+      // Still offline from a failed cycle — keep retrying the join while
+      // BLE keeps collecting. A node that can't rejoin WiFi is dead.
+      Serial.println("--- WiFi down — retrying join (BLE keeps running) ---");
+      wifiJoin(MOSAIC_WIFI_SSID, MOSAIC_WIFI_PASSWORD);
+      if (WiFi.status() == WL_CONNECTED) lastWifiScanMs = millis();
+    }
+  }
+#endif  // MOSAIC_WIFI_SCAN_ENABLE
 
   // Pause between scans (configurable; default 15s per config.example.h)
   delay(MOSAIC_SCAN_INTERVAL);

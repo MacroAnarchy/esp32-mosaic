@@ -43,3 +43,20 @@
 // Controller-level duplicate filter: report each device once per scan window.
 // 200 entries is the same cache size ESP32Marauder uses.
 #define MOSAIC_BLE_DUPLICATE_CACHE_SIZE 200
+
+// --- WiFi passive offline scan (default ON) ---
+// The "mosaic goes offline to see" cycle: every N seconds the node drops its
+// WiFi association for ~1s, hops channels 1..13 in promiscuous mode, captures
+// 802.11 beacons + probe requests (PASSIVE listen only — no deauth, no
+// injection, no beacon spam), reconnects, then reports the whole batch as one
+// type:"wifi" envelope. See docs/spec-wifi-scan.md.
+
+// Enable the periodic WiFi offline scan cycle (runs sequentially with BLE).
+#define MOSAIC_WIFI_SCAN_ENABLE 1
+
+// How often (seconds) the node goes offline to sweep the WiFi spectrum.
+// Default 300 = every 5 minutes (duty cycle ~95% connected / ~5% offline).
+#define MOSAIC_WIFI_SCAN_INTERVAL_SECONDS 300
+
+// Time (ms) spent listening on each channel. 13 channels x 80ms ≈ 1s sweep.
+#define MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS 80

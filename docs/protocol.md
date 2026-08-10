@@ -89,6 +89,48 @@ The gateway ADDS on receipt (server-side, not sent by node):
 
 All classification is passive (advertisement parsing only): no deauth, no BLE spam, no replay, no jamming. New fields are additive — v1 clients and the gateway ignore fields they don't know.
 
+### `wifi` — passive WiFi beacon/probe batch (offline scan cycle)
+The node has ONE radio: while associated to WiFi it is blind to the rest of the
+spectrum. Every `wifi_scan_interval_seconds` (default 300 = every 5 min) the node
+briefly drops its WiFi association ("the mosaic goes offline to see"), enters
+promiscuous mode, hops channels 1..13 (~80ms each, ~1s total), captures 802.11
+beacons (0x80) and probe requests (0x40), then reconnects and reports everything
+captured in one batch envelope. PASSIVE LISTEN ONLY — no deauth, no injection,
+no beacon spam. *Added v1.2 (WiFi scan port).*
+
+```json
+{
+  "type": "wifi",
+  "payload": {
+    "frames": [
+      {
+        "kind": "beacon",
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "bssid": "aa:bb:cc:dd:ee:ff",
+        "ssid": "HomeWiFi",
+        "channel": 6,
+        "rssi": -58
+      },
+      {
+        "kind": "probe_req",
+        "mac": "11:22:33:44:55:66",
+        "ssid": "CafeFreeWifi",
+        "channel": 1,
+        "rssi": -70
+      }
+    ]
+  }
+}
+```
+- `frames[]` = all frames captured during the ~1s sweep, deduped by kind+MAC+SSID within the cycle.
+- `frames[].kind` = `beacon` (AP broadcasting) or `probe_req` (client seeking).
+- `frames[].mac` = source MAC: the AP's MAC for beacons, the probing client's MAC for probe requests.
+- `frames[].bssid` = AP BSSID (beacons only; same as `mac` since BSSID == src for beacons). Omitted for probe requests.
+- `frames[].ssid` = broadcast ESSID (beacon) or the SSID the client is requesting (probe). Omitted when empty (hidden network / broadcast probe).
+- `frames[].channel` = 802.11 channel (1..13) the frame was heard on.
+- `frames[].rssi` = received signal strength in dBm.
+- After the sweep the node MUST rejoin WiFi before reporting; if the join fails it keeps retrying on subsequent cycles while BLE sensing continues (a node that can't rejoin is dead).
+
 ### `csi` — radar/presence event from CSI processing
 ```json
 {
