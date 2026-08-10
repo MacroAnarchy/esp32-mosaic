@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -140,38 +141,33 @@ def print_entity_view(rows, limit=40):
         print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['avg']:>5} {r['spread']:>4} {r['n']:>5}  {r['mac']} {mark}")
 
 
-def bind_slots(c, hours=24):
-    """Continuity-gate slot binding (data association in RSSI space).
+def analyze_handoffs(c, hours=24):
+    """Three-layer handoff analysis (data association in RSSI space).
 
-    Discriminates ROTATION (same physical object, MAC changed) from
-    TELEPORT (different object) using RSSI continuity at the handoff:
+    LAYER 1 — TIER: signal quality floor. STRONG resolves, EDGE counts only.
+    LAYER 2 — TIME DECAY: P(same) = e^(-gap/tau). Tight gaps bind strongly.
+    LAYER 3 — CONTINUITY + JUMP: rotation (level same) vs entry/exit (level jumped).
 
-      |RSSI(A last sighting) - RSSI(B first sighting)| < gate  → same object
-      B appears at a very different RSSI than A's last          → different object
-
-    Pipeline:
-      1. Find candidate pairs: A and B never coexist in the same minute
-         (weak prior — screens out the obvious).
-      2. For each pair, compare A's last RSSI vs B's first RSSI
-         (strong evidence — rotation preserves physical position).
-      3. Bind when within the continuity gate. Emit a slot record.
+    Each layer independently queryable — see --handoffs output columns.
     """
     ensure_schema(c)
-    gate = 6  # dB — RSSI continuity gate (tuned the hard way)
+    tau = 90.0           # Layer 2: decay constant (seconds) — tuned the hard way
+    continuity_gate = 6  # Layer 3: |ΔRSSI| <= this = rotation (position preserved)
+    jump_gate = 15       # Layer 3: |ΔRSSI| >= this = entry/exit (position changed)
     window_start = f"-{hours} hours"
 
-    # Per-minute presence per MAC (only reliable signals, no noise floor junk)
+    # Per-minute presence per MAC
     cur = c.execute("""
     SELECT mac, substr(received_at,1,16) AS minute
     FROM sightings
-    WHERE received_at > datetime('now', ?) AND rssi > -90
+    WHERE received_at > datetime('now', ?)
     GROUP BY mac, minute
     """, (window_start,))
     presence = {}
     for mac, minute in cur.fetchall():
         presence.setdefault(mac, set()).add(minute)
 
-    # First/last RSSI per MAC in window
+    # First/last RSSI + timestamps per MAC in window
     cur = c.execute("""
     SELECT s1.mac,
            (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
@@ -179,28 +175,31 @@ def bind_slots(c, hours=24):
            (SELECT rssi FROM sightings s3 WHERE s3.mac = s1.mac
              AND s3.received_at > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
            MIN(s1.received_at) AS first_ts,
-           MAX(s1.received_at) AS last_ts
+           MAX(s1.received_at) AS last_ts,
+           COUNT(*) AS n
     FROM sightings s1
     WHERE s1.received_at > datetime('now', ?)
     GROUP BY s1.mac
-    HAVING COUNT(*) >= 3
     """, (window_start, window_start, window_start))
     macs = {r[0]: dict(r) for r in cur.fetchall()}
 
-    # Candidate pairs: A last_seen <= B first_seen (A disappeared before B appeared)
-    # and no minute overlap (never coexisted).
-    binds = []
+    # LAYER 1: tier by average RSSI
+    def tier(avg):
+        if avg >= -70:
+            return "STRONG"
+        if avg >= -85:
+            return "MID"
+        return "EDGE"
+
+    rows = []
     mac_list = list(macs.keys())
     for i, a in enumerate(mac_list):
         for b in mac_list[i+1:]:
             A, B = macs[a], macs[b]
-            # temporal order: A must end before/around B starts
+            # temporal order: A ends before B starts
             if A["last_ts"] > B["first_ts"]:
                 continue
-            # weak prior: no shared minutes
-            if presence.get(a, set()) & presence.get(b, set()):
-                continue
-            # time gap between A's last and B's first
+            # Layer 2: gap between A's last and B's first
             from datetime import datetime
             try:
                 t_a = datetime.fromisoformat(A["last_ts"].replace("Z", "+00:00"))
@@ -208,26 +207,44 @@ def bind_slots(c, hours=24):
                 gap_s = (t_b - t_a).total_seconds()
             except Exception:
                 continue
-            if gap_s < 0 or gap_s > 3600:
-                continue  # too far apart in time to be a rotation
+            if gap_s < 0:
+                continue
+            # Layer 2: decay weight
+            weight = math.exp(-gap_s / tau)
 
-            # STRONG EVIDENCE: continuity gate on RSSI
+            # Layer 3: continuity vs jump
             delta = abs(A["last_rssi"] - B["first_rssi"])
-            if delta <= gate:
-                binds.append({
-                    "from_mac": a, "to_mac": b,
-                    "last_rssi": A["last_rssi"], "first_rssi": B["first_rssi"],
-                    "delta": delta, "gap_s": int(gap_s),
-                })
+            if delta <= continuity_gate:
+                kind = "ROTATION?"
+            elif delta >= jump_gate:
+                kind = "ENTRY/EXIT?"
+            else:
+                kind = "AMBI"
 
-    # Sort by gap (tightest rotation first), report
-    binds.sort(key=lambda x: x["gap_s"])
-    print(f"Continuity-gate binds (gate={gate}dB, {len(binds)} candidates):")
-    print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6}")
-    print("-" * 56)
-    for b in binds[:40]:
-        print(f"{b['from_mac']:<20} {b['to_mac']:<20} {b['delta']:>4} {b['gap_s']:>6}")
-    return binds
+            rows.append({
+                "from": a, "to": b,
+                "from_tier": tier(A.get("avg_rssi", A["first_rssi"])),
+                "to_tier": tier(B.get("avg_rssi", B["first_rssi"])),
+                "delta": delta, "gap_s": int(gap_s), "weight": round(weight, 2),
+                "kind": kind,
+            })
+
+    # Report: rotations first (tight gap + continuity), then jumps
+    rows.sort(key=lambda r: (-(r["kind"] == "ROTATION?"), -r["weight"]))
+    print(f"Three-layer handoffs ({len(rows)} pairs):")
+    print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  kind")
+    print("-" * 66)
+    shown = 0
+    for r in rows:
+        if r["from_tier"] != "STRONG" or r["to_tier"] != "STRONG":
+            continue  # only STRONG tier resolves entities
+        print(f"{r['from']:<20} {r['to']:<20} {r['delta']:>4} {r['gap_s']:>6} {r['weight']:>5}  {r['kind']}")
+        shown += 1
+        if shown >= 40:
+            break
+    if shown == 0:
+        print("  (no STRONG-tier handoffs in window)")
+    return rows
 
 
 def main():
@@ -235,7 +252,8 @@ def main():
     ap.add_argument("--status", action="store_true", help="entity view of recent data")
     ap.add_argument("--devices", action="store_true", help="list device table")
     ap.add_argument("--seed-labels", action="store_true", help="import owner_devices.json")
-    ap.add_argument("--bind-slots", action="store_true", help="find slot candidates for anchors")
+    ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
+    ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
 
@@ -249,9 +267,9 @@ def main():
             print(f"{'*' if r['stable'] else ' '} {r['mac']}  {r['label']}")
     if args.status:
         print_entity_view(entity_view(c, args.hours))
-    if args.bind_slots:
-        bind_slots(c, args.hours)
-    if not (args.status or args.devices or args.seed_labels or args.bind_slots):
+    if args.bind_slots or args.handoffs:
+        analyze_handoffs(c, args.hours)
+    if not (args.status or args.devices or args.seed_labels or args.bind_slots or args.handoffs):
         print_entity_view(entity_view(c, args.hours))
 
 
