@@ -1,0 +1,15 @@
+# Local config — never commit
+firmware/platformio.local.ini
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PlatformIO build artifacts
+firmware/.pio/
+
+# Local data
+*.db
+*.jsonl
+.orb/
