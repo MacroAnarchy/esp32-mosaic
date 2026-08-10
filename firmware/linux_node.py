@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Mosaic gym node — Linux node edition (v0.1).
-
-Runs on the Linux Linux box (or any Linux box with a monitor-mode WiFi
-adapter). Captures passive WiFi (probe requests + beacons with RSSI from
-radiotap headers) and optionally BLE advertisements. Emits ORB protocol v1
-envelopes to the gateway over HTTP, or appends to a local JSONL file when
-offline (synced later).
+Mosaic Linux node (v0.1) — runs on any Linux box / Android (Termux) with a
+monitor-mode WiFi adapter. Captures passive WiFi (probe requests + beacons
+with RSSI from radiotap headers) and optionally BLE advertisements. Emits
+ORB protocol v1 envelopes to the gateway over HTTP, or appends to a local
+JSONL file when offline (synced later).
 
 PORTABILITY: the envelope schema is identical to the ESP32 firmware —
 the gateway/brain does not care whether a tile is a 3€ C3 or an old phone.
@@ -161,7 +159,7 @@ def sniff_ble(seconds):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mosaic gym node (Linux node)")
+    ap = argparse.ArgumentParser(description="Mosaic Linux node (monitor-mode passive capture)")
     ap.add_argument("--interface", default="wlan1", help="monitor-mode interface")
     ap.add_argument("--node", default=NODE_NAME, help="node name in envelope")
     ap.add_argument("--ble", action="store_true", help="also capture BLE")
@@ -174,7 +172,7 @@ def main():
     offline_buf = []
     online = True
 
-    print(f"[*] Mosaic gym node '{args.node}' on {args.interface}"
+    print(f"[*] Mosaic Linux node '{args.node}' on {args.interface}"
           f"{' + BLE' if args.ble else ''}")
     print(f"[*] Gateway: {GATEWAY_URL}")
 
