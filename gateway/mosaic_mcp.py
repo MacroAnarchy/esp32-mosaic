@@ -29,6 +29,13 @@ from datetime import datetime, timezone
 
 DB = os.path.expanduser("~/.orb/orb.db")
 
+# Time-window filter normalization — same bug as mosaic_brain.py:
+# received_at is ISO-8601 ('...T22:37:33+00:00'), SQLite datetime('now') is
+# '... 22:37:33'; raw string comparison of 'T' vs ' ' silently ignored the
+# hour and returned the whole UTC day for every --hours window. Normalize the
+# stored column before comparing.
+TS_WINDOW = "REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)"
+
 
 def conn():
     c = sqlite3.connect(DB)
@@ -56,7 +63,7 @@ def tools():
                (MAX(rssi)-MIN(rssi)) AS spread,
                COUNT(*) AS n, MAX(name) AS name
         FROM sightings
-        WHERE received_at > datetime('now', ?)
+        WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
         GROUP BY mac HAVING n >= 3
         """, (f"-{hours} hours",))
         rows = _rows_to_dicts(cur.fetchall())
@@ -101,7 +108,7 @@ def tools():
         cur = c.execute("""
         SELECT d.mac, d.label, d.note, d.stable, d.entity_id,
                (SELECT COUNT(*) FROM sightings s WHERE s.mac = d.mac
-                 AND s.received_at > datetime('now', ?)) AS recent_hits
+                 AND REPLACE(substr(s.received_at,1,19),'T',' ') > datetime('now', ?)) AS recent_hits
         FROM devices d
         ORDER BY d.stable DESC, d.label
         """, (f"-{hours} hours",))
@@ -122,7 +129,7 @@ def tools():
         WHERE mac LIKE ? OR name LIKE ? OR mac IN (
             SELECT mac FROM devices WHERE label LIKE ? OR note LIKE ?
         )
-        AND received_at > datetime('now', ?)
+        AND REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
         GROUP BY mac ORDER BY n DESC LIMIT 20
         """, (q, q, q, q, f"-{hours} hours"))
         return json.dumps(_rows_to_dicts(cur.fetchall()), indent=1)
@@ -134,7 +141,7 @@ def tools():
         cur = c.execute("""
         SELECT n.node_id, n.first_seen, n.last_seen, n.last_ip, n.model,
                (SELECT COUNT(*) FROM sightings s WHERE s.node_id = n.node_id
-                 AND s.received_at > datetime('now', '-1 hour')) AS hits_1h
+                 AND REPLACE(substr(s.received_at,1,19),'T',' ') > datetime('now', '-1 hour')) AS hits_1h
         FROM nodes n ORDER BY n.last_seen DESC
         """)
         return json.dumps(_rows_to_dicts(cur.fetchall()), indent=1)
@@ -159,7 +166,7 @@ def tools():
         cur = c.execute("""
         SELECT node_id, event, COUNT(*) AS n, MAX(received_at) AS last_seen
         FROM csi_events
-        WHERE received_at > datetime('now', ?)
+        WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
         GROUP BY node_id, event ORDER BY n DESC
         """, (f"-{hours} hours",))
         return json.dumps(_rows_to_dicts(cur.fetchall()), indent=1)

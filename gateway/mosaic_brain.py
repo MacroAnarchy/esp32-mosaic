@@ -35,6 +35,15 @@ DB = os.path.expanduser("~/.orb/orb.db")
 LABELS_FILE = os.path.expanduser("~/.orb/owner_devices.json")
 LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
 
+# Time-window filter normalization.
+# received_at is stored ISO-8601 ('2026-08-10T22:37:33+00:00') while SQLite's
+# datetime('now') yields '2026-08-10 22:37:33'. Naive string comparison of the
+# two formats mis-orders them ('T' (0x54) > ' ' (0x20)), so every --hours N
+# window silently returned ALL rows from the same UTC day (including old test
+# payloads). Normalize the stored column to SQLite's format before comparing.
+# Use via: WHERE {TS_WINDOW}   (add the alias prefix for correlated subqueries)
+TS_WINDOW = "REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)"
+
 # Tuning (static for now — tuned the hard way, see gateway config)
 STATIONARY_MAX_SPREAD = 15   # dB: below this = stationary (data: Aqara 12, Philips 12)
 MOVING_MIN_SPREAD = 30       # dB: above this = clearly moving (data: PAX 38, watch 46)
@@ -165,7 +174,7 @@ def device_stats(c, hours=24):
             WHERE s2.mac = s.mac AND s2.device_class IS NOT NULL
             ORDER BY s2.received_at DESC LIMIT 1) AS device_class
     FROM sightings s
-    WHERE s.received_at > datetime('now', ?)
+    WHERE REPLACE(substr(s.received_at,1,19),'T',' ') > datetime('now', ?)
     GROUP BY mac
     HAVING n >= 3
     ORDER BY spread DESC
@@ -318,7 +327,7 @@ def analyze_handoffs(c, hours=24, report=True):
     cur = c.execute("""
     SELECT mac, substr(received_at,1,16) AS minute
     FROM sightings
-    WHERE received_at > datetime('now', ?)
+    WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
     GROUP BY mac, minute
     """, (window_start,))
     presence = {}
@@ -329,19 +338,19 @@ def analyze_handoffs(c, hours=24, report=True):
     cur = c.execute("""
     SELECT s1.mac,
            (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
-            AND s2.received_at > datetime('now', ?) ORDER BY s2.received_at ASC LIMIT 1) AS first_rssi,
+            AND REPLACE(substr(s2.received_at,1,19),'T',' ') > datetime('now', ?) ORDER BY s2.received_at ASC LIMIT 1) AS first_rssi,
            (SELECT rssi FROM sightings s3 WHERE s3.mac = s1.mac
-            AND s3.received_at > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
+            AND REPLACE(substr(s3.received_at,1,19),'T',' ') > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
            ROUND(AVG(s1.rssi),1) AS avg_rssi,
            MIN(s1.received_at) AS first_ts,
            MAX(s1.received_at) AS last_ts,
            COUNT(*) AS n,
            (SELECT device_class FROM sightings s4
             WHERE s4.mac = s1.mac AND s4.device_class IS NOT NULL
-            AND s4.received_at > datetime('now', ?)
+            AND REPLACE(substr(s4.received_at,1,19),'T',' ') > datetime('now', ?)
             ORDER BY s4.received_at DESC LIMIT 1) AS device_class
     FROM sightings s1
-    WHERE s1.received_at > datetime('now', ?)
+    WHERE REPLACE(substr(s1.received_at,1,19),'T',' ') > datetime('now', ?)
     GROUP BY s1.mac
     """, (window_start, window_start, window_start, window_start))
     macs = {r[0]: dict(r) for r in cur.fetchall()}
