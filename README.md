@@ -25,6 +25,20 @@ not a microphone — radio identity. Your phone, watch and earbuds form an
 entity cluster; the system learns what "you" looks like in RF, and CSI can
 later confirm a human body is actually there. Spoof-resistant presence.
 
+## Use cases
+
+- **Presence-gated AI** — your assistant only listens to you, because it knows
+  who you are by radio (entity cluster + proximity + body verification).
+- **Home security** — the radar knows the RF baseline of your home. An unknown
+  device appearing at -30 dBm at 3am, or a CSI field deviation in an empty room,
+  is an event your home can report itself. No cameras, no microphones, no cloud.
+- **Surveillance / tracking** — watch what enters and leaves a space, learn
+  habitual paths (bedroom → kitchen → door every morning), know when a person
+  returns by their device constellation. The remembering radar — it sees what
+  other scanners forget.
+- **Smart-home automation** — "the owner is home" triggers scenes from RF presence,
+  not phone GPS or app state. The room knows when you're actually in it.
+
 ## What's inside
 
 ```
