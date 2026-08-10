@@ -141,43 +141,93 @@ def print_entity_view(rows, limit=40):
 
 
 def bind_slots(c, hours=24):
-    """Barebones slot binding: for each STABLE device, find NEW MACs that
-    co-occur (seen in the same minute as the anchor). Those become
-    slot candidates for the anchor's entity. MUTED devices excluded."""
+    """Continuity-gate slot binding (data association in RSSI space).
+
+    Discriminates ROTATION (same physical object, MAC changed) from
+    TELEPORT (different object) using RSSI continuity at the handoff:
+
+      |RSSI(A last sighting) - RSSI(B first sighting)| < gate  → same object
+      B appears at a very different RSSI than A's last          → different object
+
+    Pipeline:
+      1. Find candidate pairs: A and B never coexist in the same minute
+         (weak prior — screens out the obvious).
+      2. For each pair, compare A's last RSSI vs B's first RSSI
+         (strong evidence — rotation preserves physical position).
+      3. Bind when within the continuity gate. Emit a slot record.
+    """
     ensure_schema(c)
-    stable_devs = [r for r in c.execute("SELECT mac, label FROM devices WHERE stable=1")]
-    if not stable_devs:
-        print("No stable anchors seeded yet (run --seed-labels first).")
-        return
+    gate = 6  # dB — RSSI continuity gate (tuned the hard way)
+    window_start = f"-{hours} hours"
 
-    # snapshot of anchor appearances (minute buckets)
-    for anchor in stable_devs:
-        amac = anchor["mac"]
-        cur = c.execute("""
-        SELECT DISTINCT substr(received_at,1,16) AS minute
-        FROM sightings WHERE mac=? AND rssi > -85
-        """, (amac,))
-        anchor_minutes = {r["minute"] for r in cur}
-        if not anchor_minutes:
-            continue
+    # Per-minute presence per MAC (only reliable signals, no noise floor junk)
+    cur = c.execute("""
+    SELECT mac, substr(received_at,1,16) AS minute
+    FROM sightings
+    WHERE received_at > datetime('now', ?) AND rssi > -90
+    GROUP BY mac, minute
+    """, (window_start,))
+    presence = {}
+    for mac, minute in cur.fetchall():
+        presence.setdefault(mac, set()).add(minute)
 
-        # MACs seen in those same minutes (excluding the anchor itself)
-        qmarks = ",".join("?" * len(anchor_minutes))
-        cur = c.execute(f"""
-        SELECT mac, COUNT(DISTINCT substr(received_at,1,16)) AS hits
-        FROM sightings
-        WHERE substr(received_at,1,16) IN ({qmarks})
-          AND mac != ?
-          AND rssi > -85
-        GROUP BY mac
-        ORDER BY hits DESC
-        LIMIT 8
-        """, (*anchor_minutes, amac))
-        print(f"\nEntity slot for {anchor['label']} ({amac}):")
-        for r in cur:
-            ratio = round(r["hits"] / max(len(anchor_minutes), 1), 2)
-            if ratio >= 0.5:
-                print(f"  → {r['mac']}  co-occur {r['hits']}/{len(anchor_minutes)} ({ratio})")
+    # First/last RSSI per MAC in window
+    cur = c.execute("""
+    SELECT s1.mac,
+           (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
+             AND s2.received_at > datetime('now', ?) ORDER BY s2.received_at ASC LIMIT 1) AS first_rssi,
+           (SELECT rssi FROM sightings s3 WHERE s3.mac = s1.mac
+             AND s3.received_at > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
+           MIN(s1.received_at) AS first_ts,
+           MAX(s1.received_at) AS last_ts
+    FROM sightings s1
+    WHERE s1.received_at > datetime('now', ?)
+    GROUP BY s1.mac
+    HAVING COUNT(*) >= 3
+    """, (window_start, window_start, window_start))
+    macs = {r[0]: dict(r) for r in cur.fetchall()}
+
+    # Candidate pairs: A last_seen <= B first_seen (A disappeared before B appeared)
+    # and no minute overlap (never coexisted).
+    binds = []
+    mac_list = list(macs.keys())
+    for i, a in enumerate(mac_list):
+        for b in mac_list[i+1:]:
+            A, B = macs[a], macs[b]
+            # temporal order: A must end before/around B starts
+            if A["last_ts"] > B["first_ts"]:
+                continue
+            # weak prior: no shared minutes
+            if presence.get(a, set()) & presence.get(b, set()):
+                continue
+            # time gap between A's last and B's first
+            from datetime import datetime
+            try:
+                t_a = datetime.fromisoformat(A["last_ts"].replace("Z", "+00:00"))
+                t_b = datetime.fromisoformat(B["first_ts"].replace("Z", "+00:00"))
+                gap_s = (t_b - t_a).total_seconds()
+            except Exception:
+                continue
+            if gap_s < 0 or gap_s > 3600:
+                continue  # too far apart in time to be a rotation
+
+            # STRONG EVIDENCE: continuity gate on RSSI
+            delta = abs(A["last_rssi"] - B["first_rssi"])
+            if delta <= gate:
+                binds.append({
+                    "from_mac": a, "to_mac": b,
+                    "last_rssi": A["last_rssi"], "first_rssi": B["first_rssi"],
+                    "delta": delta, "gap_s": int(gap_s),
+                })
+
+    # Sort by gap (tightest rotation first), report
+    binds.sort(key=lambda x: x["gap_s"])
+    print(f"Continuity-gate binds (gate={gate}dB, {len(binds)} candidates):")
+    print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6}")
+    print("-" * 56)
+    for b in binds[:40]:
+        print(f"{b['from_mac']:<20} {b['to_mac']:<20} {b['delta']:>4} {b['gap_s']:>6}")
+    return binds
 
 
 def main():
