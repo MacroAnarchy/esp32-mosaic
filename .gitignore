@@ -1,4 +1,6 @@
 # Local config — never commit
+firmware/include/config.h
+gateway/config.yaml
 firmware/platformio.local.ini
 
 # Python

@@ -53,15 +53,17 @@ All intelligence lives server-side. The protocol is one envelope, many payloads.
 ### 1. Gateway (on any always-on machine)
 
 ```bash
+cd gateway
+cp config.example.yaml config.yaml   # edit port/data_dir if needed
 pip install aiohttp
-python3 gateway/orb_gateway.py --port 9000
+python3 orb_gateway.py
 ```
 
 ### 2. Firmware (on an ESP32)
 
 ```bash
 cd firmware
-cp platformio.ini platformio.local.ini   # fill in your WiFi + gateway IP
+cp include/config.example.h include/config.h   # fill in WiFi + gateway IP + node name
 pio run -t upload
 ```
 

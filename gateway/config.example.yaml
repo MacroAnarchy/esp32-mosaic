@@ -1,0 +1,21 @@
+# ESP32-Mosaic — gateway configuration
+#
+# Copy this file to config.yaml (same folder) and edit.
+# config.yaml is gitignored.
+#
+#   cp config.example.yaml config.yaml
+
+# Bind address (0.0.0.0 = all interfaces)
+host: 0.0.0.0
+port: 9000
+
+# Where the gateway stores data
+data_dir: ~/.orb
+
+# Canonical JSONL log + SQLite query layer (relative to data_dir)
+log_file: presence.jsonl
+db_file: orb.db
+
+# Optional: shared auth token for ingest. Leave empty for no auth.
+# If set, nodes must send header "X-Mosaic-Token: <token>".
+ingest_token: ""

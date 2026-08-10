@@ -19,6 +19,9 @@
 #include <BLEAdvertisedDevice.h>
 #include <HTTPClient.h>
 
+// Local config (gitignored — copy from include/config.example.h)
+#include "config.h"
+
 // Scan results callback
 class ScanCallback : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
@@ -29,13 +32,7 @@ class ScanCallback : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-// Gateway endpoint (set via build flags in platformio.ini / platformio.local.ini)
-#ifndef MOSAIC_GATEWAY_HOST
-#define MOSAIC_GATEWAY_HOST "192.168.1.10"
-#endif
-#ifndef MOSAIC_GATEWAY_PORT
-#define MOSAIC_GATEWAY_PORT 9000
-#endif
+// Gateway endpoint (from config.h)
 const char* gatewayHost = MOSAIC_GATEWAY_HOST;
 const int gatewayPort = MOSAIC_GATEWAY_PORT;
 
@@ -82,7 +79,7 @@ void loop() {
     HTTPClient http;
     String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
     String bssid = WiFi.BSSIDstr();
-    String payload = "{\"v\":1,\"node\":\"node-01\",\"type\":\"scan\",\"ts\":" + String(millis()) +
+    String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) + "\",\"type\":\"scan\",\"ts\":" + String(millis()) +
                      ",\"payload\":{\"ap_bssid\":\"" + bssid +
                      "\",\"devices\":[";
     for (int i = 0; i < count; i++) {
