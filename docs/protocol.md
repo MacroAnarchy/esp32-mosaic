@@ -57,7 +57,15 @@ The gateway ADDS on receipt (server-side, not sent by node):
   "payload": {
     "ap_bssid": "aa:bb:cc:dd:ee:ff",
     "devices": [
-      {"mac": "24:5f:9f:db:9f:72", "rssi": -62, "name": "HUAWEI WATCH FIT 3-F72"}
+      {
+        "mac": "24:5f:9f:db:9f:72",
+        "rssi": -62,
+        "name": "HUAWEI WATCH FIT 3-F72",
+        "device_class": "unknown",
+        "company_id": 76,
+        "service_uuids": ["fd44"],
+        "service_data_uuid": "fd5f"
+      }
     ]
   }
 }
@@ -66,6 +74,20 @@ The gateway ADDS on receipt (server-side, not sent by node):
 - `devices[].mac` = MAC as seen (may be randomized — server dedups by its own logic).
 - `devices[].rssi` = signal strength in dBm.
 - `devices[].name` = BLE advertised name, if any.
+- `devices[].device_class` = passive classification of the advertiser (see below). *Added v1.1 (BLE port).*
+- `devices[].company_id` = Bluetooth SIG company/manufacturer ID from the advertisement's manufacturer data, little-endian uint16. Present only when manufacturer data exists. *Added v1.1.*
+- `devices[].service_uuids` = array of 16-bit service UUID strings the device advertises (e.g. `["fd44"]`). Omitted when the device advertises none. *Added v1.1.*
+- `devices[].service_data_uuid` = 16-bit service data UUID, when the device broadcasts service data (e.g. `"fd5f"`). *Added v1.1.*
+
+#### `device_class` values (v1.1)
+| Value | Meaning | Detection |
+|---|---|---|
+| `findmy` | Apple FindMy network device (AirTag, AirPods, third-party FindMy tags) | Advertises FMNA service `0000fd44-...` or FMDN service `7dfc9001-...`, or carries an Apple offline-finding payload signature (`0x1E 0xFF 0x4C 0x00` / `0x4C 0x00 0x12`) |
+| `meta` | Meta Quest / Ray-Ban (Luxottica) headset or controller | Company ID ∈ {0xFD5F, 0xFEB7, 0xFEB8, 0x01AB, 0x058E, 0x0D53} |
+| `flipper` | Flipper Zero | Company ID `0x0FBA` (note: a Flipper impersonating a FindMy tag is reported as `findmy`) |
+| `unknown` | Everything else, including high-volume consumer IDs (Apple `0x004C`, Samsung `0xFD5A`/`0xFD69`, Microsoft `0x0006`, phone `0xFEF3`) | — |
+
+All classification is passive (advertisement parsing only): no deauth, no BLE spam, no replay, no jamming. New fields are additive — v1 clients and the gateway ignore fields they don't know.
 
 ### `csi` — radar/presence event from CSI processing
 ```json
