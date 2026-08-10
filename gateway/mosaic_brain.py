@@ -30,6 +30,7 @@ STATIONARY_MAX_SPREAD = 15   # dB: below this = stationary (data: Aqara 12, Phil
 MOVING_MIN_SPREAD = 30       # dB: above this = clearly moving (data: PAX 38, watch 46)
 MUTED_SPREAD = 25            # dB: above this = location evidence muted
 CO_OCCUR_BIND_SECONDS = 120  # new MAC seen within this of an anchor = slot candidate
+CO_OCCUR_LEVEL_GATE = 8      # dB: same-entity rotation keeps signal level (data: -62 cluster ±3)
 
 
 def conn():
@@ -148,9 +149,15 @@ def collapse_chains(rows, min_weight=0.7):
     entity slot. Union-find over the bind graph. Returns list of chains,
     each = ordered list of MACs (by first appearance).
     """
-    # Only rotation binds (continuity) with sufficient time-decay weight
+    # Only rotation binds (continuity) with sufficient time-decay weight,
+    # STRONG-tier pairs only (same policy as the handoff report: weak/faint
+    # devices do not resolve into entity slots), AND level coherence:
+    # same-entity rotation keeps signal level (a phone rotating MACs stays
+    # ~-62; bridging to a -90 neighbor is over-merge).
     edges = [(r["from"], r["to"], r["weight"]) for r in rows
-             if r["kind"] == "ROTATION?" and r["weight"] >= min_weight]
+             if r["kind"] == "ROTATION?" and r["weight"] >= min_weight
+             and r["from_tier"] == "STRONG" and r["to_tier"] == "STRONG"
+             and abs(r["from_avg"] - r["to_avg"]) <= CO_OCCUR_LEVEL_GATE]
 
     parent = {}
     def find(x):
@@ -230,9 +237,10 @@ def analyze_handoffs(c, hours=24, report=True):
     cur = c.execute("""
     SELECT s1.mac,
            (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
-             AND s2.received_at > datetime('now', ?) ORDER BY s2.received_at ASC LIMIT 1) AS first_rssi,
+            AND s2.received_at > datetime('now', ?) ORDER BY s2.received_at ASC LIMIT 1) AS first_rssi,
            (SELECT rssi FROM sightings s3 WHERE s3.mac = s1.mac
-             AND s3.received_at > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
+            AND s3.received_at > datetime('now', ?) ORDER BY s3.received_at DESC LIMIT 1) AS last_rssi,
+           ROUND(AVG(s1.rssi),1) AS avg_rssi,
            MIN(s1.received_at) AS first_ts,
            MAX(s1.received_at) AS last_ts,
            COUNT(*) AS n
@@ -282,8 +290,9 @@ def analyze_handoffs(c, hours=24, report=True):
 
             rows.append({
                 "from": a, "to": b,
-                "from_tier": tier(A.get("avg_rssi", A["first_rssi"])),
-                "to_tier": tier(B.get("avg_rssi", B["first_rssi"])),
+                "from_tier": tier(A["avg_rssi"]),
+                "to_tier": tier(B["avg_rssi"]),
+                "from_avg": A["avg_rssi"], "to_avg": B["avg_rssi"],
                 "delta": delta, "gap_s": int(gap_s), "weight": round(weight, 2),
                 "kind": kind,
             })
