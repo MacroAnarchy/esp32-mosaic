@@ -73,7 +73,7 @@ def load_config():
     token = cfg.get("ingest_token", "") or ""
     return server, wm, token
 
-VALID_TYPES = {"scan", "csi", "imu", "state"}
+VALID_TYPES = {"scan", "csi", "imu", "state", "wifi"}
 
 # ---------------------------------------------------------------------------
 # SQLite layer
@@ -96,12 +96,15 @@ CREATE TABLE IF NOT EXISTS events (
     payload     TEXT
 );
 CREATE TABLE IF NOT EXISTS sightings (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    received_at TEXT,
-    node_id     TEXT,
-    mac         TEXT,
-    rssi        INTEGER,
-    name        TEXT
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at   TEXT,
+    node_id       TEXT,
+    mac           TEXT,
+    rssi          INTEGER,
+    name          TEXT,
+    device_class  TEXT,
+    company_id    INTEGER,
+    service_uuids TEXT
 );
 CREATE TABLE IF NOT EXISTS csi_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,17 +116,61 @@ CREATE TABLE IF NOT EXISTS csi_events (
     wander      REAL,
     jitter      REAL
 );
+-- WiFi places registry: BSSIDs seen in type:"wifi" beacon frames.
+-- A BSSID that never moves + stable RSSI = a PLACE (the brain marks it).
+CREATE TABLE IF NOT EXISTS places (
+    bssid       TEXT PRIMARY KEY,
+    ssid        TEXT,
+    channel     INTEGER,
+    first_seen  TEXT,
+    last_seen   TEXT,
+    seen_count  INTEGER DEFAULT 1,
+    min_rssi    INTEGER,
+    max_rssi    INTEGER,
+    avg_rssi    REAL,
+    stable      INTEGER DEFAULT 0
+);
+-- WiFi probe-request log: client MACs seeking SSIDs ("identity from the air").
+CREATE TABLE IF NOT EXISTS probes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at TEXT,
+    node_id     TEXT,
+    client_mac  TEXT,
+    ssid        TEXT,
+    channel     INTEGER,
+    rssi        INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_sightings_mac ON sightings(mac);
 CREATE INDEX IF NOT EXISTS idx_sightings_time ON sightings(received_at);
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(node_id);
+CREATE INDEX IF NOT EXISTS idx_places_last_seen ON places(last_seen);
+CREATE INDEX IF NOT EXISTS idx_probes_ssid ON probes(ssid);
+CREATE INDEX IF NOT EXISTS idx_probes_mac ON probes(client_mac);
 """
+
+# Columns added after the original v1 schema shipped — ALTERed in on existing
+# databases so old orb.db files keep working (CREATE TABLE IF NOT EXISTS does
+# not add columns to an existing table).
+SIGHTINGS_ADDED_COLUMNS = {
+    "device_class": "TEXT",
+    "company_id": "INTEGER",
+    "service_uuids": "TEXT",
+}
 
 
 class DB:
     def __init__(self, path):
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """Add columns that landed after the first shipped schema (idempotent)."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(sightings)")}
+        for name, decl in SIGHTINGS_ADDED_COLUMNS.items():
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE sightings ADD COLUMN {name} {decl}")
 
     def record(self, rec):
         """Store one stamped envelope."""
@@ -146,18 +193,63 @@ class DB:
             """INSERT INTO nodes (node_id, first_seen, last_seen, last_ip, model, firmware)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(node_id) DO UPDATE SET
-                 last_seen=excluded.last_seen, last_ip=excluded.last_ip,
-                 model=COALESCE(excluded.model, model), firmware=COALESCE(excluded.firmware, firmware)""",
+                last_seen=excluded.last_seen, last_ip=excluded.last_ip,
+                model=COALESCE(excluded.model, model), firmware=COALESCE(excluded.firmware, firmware)""",
             (node, now, now, rec.get("source_ip", ""), model, fw),
         )
 
         # sightings
         if typ == "scan":
             for dev in payload.get("devices", []):
+                su = dev.get("service_uuids")
                 cur.execute(
-                    "INSERT INTO sightings (received_at, node_id, mac, rssi, name) VALUES (?,?,?,?,?)",
-                    (now, node, dev.get("mac", "?"), dev.get("rssi"), dev.get("name")),
+                    """INSERT INTO sightings
+                       (received_at, node_id, mac, rssi, name, device_class, company_id, service_uuids)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (now, node, dev.get("mac", "?"), dev.get("rssi"), dev.get("name"),
+                     dev.get("device_class"), dev.get("company_id"),
+                     json.dumps(su) if su else None),
                 )
+
+        # wifi: beacon frames feed the places registry (BSSID → place),
+        # probe requests are logged as identity-from-the-air events.
+        if typ == "wifi":
+            for fr in payload.get("frames", []):
+                if not isinstance(fr, dict):
+                    continue
+                kind = fr.get("kind")
+                if kind == "beacon":
+                    bssid = (fr.get("bssid") or fr.get("mac") or "").lower()
+                    if not bssid:
+                        continue
+                    rssi = fr.get("rssi")
+                    cur.execute(
+                        """INSERT INTO places (bssid, ssid, channel, first_seen, last_seen,
+                                               seen_count, min_rssi, max_rssi, avg_rssi)
+                           VALUES (?,?,?,?,?,1,?,?,?)
+                           ON CONFLICT(bssid) DO UPDATE SET
+                             ssid=COALESCE(excluded.ssid, places.ssid),
+                             channel=COALESCE(excluded.channel, places.channel),
+                             first_seen=MIN(places.first_seen, excluded.first_seen),
+                             last_seen=MAX(places.last_seen, excluded.last_seen),
+                             seen_count=places.seen_count+1,
+                             min_rssi=CASE WHEN excluded.min_rssi IS NULL THEN places.min_rssi
+                                           ELSE MIN(places.min_rssi, excluded.min_rssi) END,
+                             max_rssi=CASE WHEN excluded.max_rssi IS NULL THEN places.max_rssi
+                                           ELSE MAX(places.max_rssi, excluded.max_rssi) END,
+                             avg_rssi=CASE WHEN excluded.avg_rssi IS NULL THEN places.avg_rssi
+                                           ELSE (places.avg_rssi*places.seen_count + excluded.avg_rssi)
+                                                / (places.seen_count+1) END""",
+                        (bssid, fr.get("ssid"), fr.get("channel"),
+                         now, now, rssi, rssi, rssi),
+                    )
+                elif kind == "probe_req":
+                    cur.execute(
+                        """INSERT INTO probes (received_at, node_id, client_mac, ssid, channel, rssi)
+                           VALUES (?,?,?,?,?,?)""",
+                        (now, node, (fr.get("mac") or "?").lower(), fr.get("ssid"),
+                         fr.get("channel"), fr.get("rssi")),
+                    )
 
         # csi events
         if typ == "csi":

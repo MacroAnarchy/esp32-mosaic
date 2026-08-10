@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """
-mosaic_brain.py — ESP32-Mosaic world-model brain (v0.1 barebones).
+mosaic_brain.py — ESP32-Mosaic world-model brain (v0.2: device_class + wifi).
 
 Turns the raw sighting stream into ENTITIES:
   - Per-device RSSI stats (min/max/avg/spread) → stationary vs moving
   - Device labels/notes (from devices table, seeded from owner_devices.json)
   - Entity slots: rotating BLE MACs bind to stable anchors via co-occurrence
+  - Class coherence: same device_class at same RSSI level = same entity
+    (FindMy/Meta accessories keep their class across MAC rotation)
+  - FindMy/AirTag entities labeled distinctly ("findmy-*" / "airtag-*")
+  - WiFi places registry: type:"wifi" beacons → BSSID → PLACE entities
+  - Probe-request log: which client MACs seek which SSIDs (identity from the air)
   - MOVING = MUTED: windows where the device moved are not location evidence
 
 Usage:
   python3 mosaic_brain.py --status          # entity view of recent data
   python3 mosaic_brain.py --devices         # device table
   python3 mosaic_brain.py --seed-labels     # import owner_devices.json labels
+  python3 mosaic_brain.py --chains          # class-weighted entity chains
+  python3 mosaic_brain.py --places          # BSSID registry → PLACE entities
+  python3 mosaic_brain.py --probes          # probe-request identity log
+  python3 mosaic_brain.py --where "home"    # resolve a place label via BSSIDs
 """
 
 import argparse
@@ -24,6 +33,7 @@ from datetime import datetime, timezone
 
 DB = os.path.expanduser("~/.orb/orb.db")
 LABELS_FILE = os.path.expanduser("~/.orb/owner_devices.json")
+LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
 
 # Tuning (static for now — tuned the hard way, see gateway config)
 STATIONARY_MAX_SPREAD = 15   # dB: below this = stationary (data: Aqara 12, Philips 12)
@@ -31,6 +41,42 @@ MOVING_MIN_SPREAD = 30       # dB: above this = clearly moving (data: PAX 38, wa
 MUTED_SPREAD = 25            # dB: above this = location evidence muted
 CO_OCCUR_BIND_SECONDS = 120  # new MAC seen within this of an anchor = slot candidate
 CO_OCCUR_LEVEL_GATE = 8      # dB: same-entity rotation keeps signal level (data: -62 cluster ±3)
+
+# Class coherence (BLE): the SAME device_class at the SAME RSSI level is much
+# stronger evidence of one rotating entity; DIFFERENT classes at one level are
+# different devices (a phone and an AirTag at -62 dB are NOT the same entity).
+# Recognized classes carry identity; "unknown" carries none.
+RECOGNIZED_CLASSES = {"findmy", "meta", "flipper"}
+
+# New knobs (overridable via gateway/config.yaml → world_model)
+DEFAULT_WM = {
+    "class_match_multiplier": 1.5,      # same recognized class at same level
+    "class_mismatch_penalty": 0.3,      # different classes at same level
+    "place_min_seen": 3,                # beacon sightings before a BSSID is a place
+    "place_max_rssi_variance": 6,       # dB: stable-RSSI gate for PLACE
+    "place_min_span_seconds": 86400,    # min first→last span for PLACE (24h)
+}
+
+
+def load_wm():
+    """Read world_model from gateway/config.yaml (mirrors orb_gateway.load_config).
+    Falls back to DEFAULT_WM when missing — the brain must always run."""
+    wm = dict(DEFAULT_WM)
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "config.yaml")
+    if os.path.exists(path):
+        try:
+            import yaml
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+            wm_cfg = (cfg.get("world_model") or {}) or {}
+            wm.update({k: v for k, v in wm_cfg.items() if k in wm and v is not None})
+        except Exception:
+            pass
+    return wm
+
+
+WM = load_wm()
 
 
 def conn():
@@ -49,6 +95,33 @@ def ensure_schema(c):
         stable      INTEGER DEFAULT 0,
         first_seen  TEXT,
         last_seen   TEXT
+    )
+    """)
+    # WiFi places registry (written by the gateway from type:"wifi" beacons)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS places (
+        bssid       TEXT PRIMARY KEY,
+        ssid        TEXT,
+        channel     INTEGER,
+        first_seen  TEXT,
+        last_seen   TEXT,
+        seen_count  INTEGER DEFAULT 1,
+        min_rssi    INTEGER,
+        max_rssi    INTEGER,
+        avg_rssi    REAL,
+        stable      INTEGER DEFAULT 0
+    )
+    """)
+    # WiFi probe-request log (written by the gateway)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS probes (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_at TEXT,
+        node_id     TEXT,
+        client_mac  TEXT,
+        ssid        TEXT,
+        channel     INTEGER,
+        rssi        INTEGER
     )
     """)
 
@@ -78,7 +151,7 @@ def seed_labels(c):
 
 
 def device_stats(c, hours=24):
-    """Per-device RSSI stats over the window."""
+    """Per-device RSSI stats over the window, plus the latest device_class."""
     cur = c.execute("""
     SELECT mac,
            MIN(rssi) AS min_rssi,
@@ -87,7 +160,10 @@ def device_stats(c, hours=24):
            (MAX(rssi)-MIN(rssi)) AS spread,
            COUNT(*) AS n,
            MAX(name) AS name,
-           MAX(s.received_at) AS last_seen
+           MAX(s.received_at) AS last_seen,
+           (SELECT device_class FROM sightings s2
+            WHERE s2.mac = s.mac AND s2.device_class IS NOT NULL
+            ORDER BY s2.received_at DESC LIMIT 1) AS device_class
     FROM sightings s
     WHERE s.received_at > datetime('now', ?)
     GROUP BY mac
@@ -106,6 +182,7 @@ def entity_view(c, hours=24):
     rows = []
     for s in stats:
         mac = s["mac"]
+        dclass = s["device_class"]
         lbl = labels.get(mac)
         label = lbl["label"] if lbl and lbl["label"] else (s["name"] or mac[:8])
         stable = bool(lbl["stable"]) if lbl else False
@@ -119,6 +196,14 @@ def entity_view(c, hours=24):
             move_class = "AMBI"
         muted = s["spread"] >= MUTED_SPREAD  # moving = location evidence muted
 
+        # FindMy/AirTag labels: distinct namespace, auto-labeled when the
+        # firmware classifies a device as findmy and nobody named it yet.
+        # A STATIC findmy device is a PLACE candidate (rotates slowly, stays put).
+        if dclass == "findmy" and not (lbl and lbl["label"]):
+            label = f"findmy-{mac[:8]}"
+        if dclass == "findmy":
+            label = label if label.startswith(("findmy-", "airtag-")) else f"findmy/{label}"
+
         rows.append({
             "mac": mac,
             "label": label,
@@ -126,6 +211,8 @@ def entity_view(c, hours=24):
             "min": s["min_rssi"], "max": s["max_rssi"], "avg": s["avg_rssi"],
             "spread": s["spread"], "n": s["n"],
             "class": move_class, "muted": muted,
+            "dclass": dclass or "-",
+            "place_candidate": dclass == "findmy" and move_class == "STATIC",
         })
     return rows
 
@@ -134,12 +221,13 @@ def print_entity_view(rows, limit=40):
     if not rows:
         print("No data in window (need >=3 sightings per device).")
         return
-    print(f"{'LABEL':<26} {'class':<7} {'avg':>5} {'spr':>4} {'n':>5}  mac")
-    print("-" * 78)
+    print(f"{'LABEL':<26} {'class':<7} {'dclass':<9} {'avg':>5} {'spr':>4} {'n':>5}  mac")
+    print("-" * 88)
     for r in rows[:limit]:
         mark = "MUTED" if r["muted"] else ""
         stable_m = "*" if r["stable"] else " "
-        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['avg']:>5} {r['spread']:>4} {r['n']:>5}  {r['mac']} {mark}")
+        pc = "PLACE?" if r["place_candidate"] else ""
+        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['n']:>5}  {r['mac']} {mark} {pc}")
 
 
 def collapse_chains(rows, min_weight=0.7):
@@ -213,6 +301,9 @@ def analyze_handoffs(c, hours=24, report=True):
     LAYER 1 — TIER: signal quality floor. STRONG resolves, EDGE counts only.
     LAYER 2 — TIME DECAY: P(same) = e^(-gap/tau). Tight gaps bind strongly.
     LAYER 3 — CONTINUITY + JUMP: rotation (level same) vs entry/exit (level jumped).
+    LAYER 4 — CLASS COHERENCE: same recognized device_class at the same level
+              = same entity (weight ×class_match_multiplier); different classes
+              = different entities (weight ×class_mismatch_penalty).
 
     Each layer independently queryable — see --handoffs output columns.
     """
@@ -221,6 +312,7 @@ def analyze_handoffs(c, hours=24, report=True):
     continuity_gate = 6  # Layer 3: |ΔRSSI| <= this = rotation (position preserved)
     jump_gate = 15       # Layer 3: |ΔRSSI| >= this = entry/exit (position changed)
     window_start = f"-{hours} hours"
+    wm = WM  # class coherence knobs (config-tunable)
 
     # Per-minute presence per MAC
     cur = c.execute("""
@@ -233,7 +325,7 @@ def analyze_handoffs(c, hours=24, report=True):
     for mac, minute in cur.fetchall():
         presence.setdefault(mac, set()).add(minute)
 
-    # First/last RSSI + timestamps per MAC in window
+    # First/last RSSI + timestamps per MAC in window (+ latest device_class)
     cur = c.execute("""
     SELECT s1.mac,
            (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
@@ -243,11 +335,15 @@ def analyze_handoffs(c, hours=24, report=True):
            ROUND(AVG(s1.rssi),1) AS avg_rssi,
            MIN(s1.received_at) AS first_ts,
            MAX(s1.received_at) AS last_ts,
-           COUNT(*) AS n
+           COUNT(*) AS n,
+           (SELECT device_class FROM sightings s4
+            WHERE s4.mac = s1.mac AND s4.device_class IS NOT NULL
+            AND s4.received_at > datetime('now', ?)
+            ORDER BY s4.received_at DESC LIMIT 1) AS device_class
     FROM sightings s1
     WHERE s1.received_at > datetime('now', ?)
     GROUP BY s1.mac
-    """, (window_start, window_start, window_start))
+    """, (window_start, window_start, window_start, window_start))
     macs = {r[0]: dict(r) for r in cur.fetchall()}
 
     # LAYER 1: tier by average RSSI
@@ -257,6 +353,18 @@ def analyze_handoffs(c, hours=24, report=True):
         if avg >= -85:
             return "MID"
         return "EDGE"
+
+    # LAYER 4: class coherence factor for a pair.
+    #  - both recognized (findmy/meta/flipper) and equal  → class_match   ×mult
+    #  - one or both recognized but different              → class_mismatch ×pen
+    #  - unknown/missing class carries no identity signal  → ×1.0
+    def class_factor(ca, cb):
+        ra, rb = ca in RECOGNIZED_CLASSES, cb in RECOGNIZED_CLASSES
+        if ra and rb and ca == cb:
+            return wm["class_match_multiplier"], "match"
+        if (ra or rb) and ca != cb:
+            return wm["class_mismatch_penalty"], "mismatch"
+        return 1.0, "-"
 
     rows = []
     mac_list = list(macs.keys())
@@ -288,32 +396,159 @@ def analyze_handoffs(c, hours=24, report=True):
             else:
                 kind = "AMBI"
 
+            # Layer 4: class coherence weight
+            cfac, cmatch = class_factor(A.get("device_class"), B.get("device_class"))
+            weight = round(weight * cfac, 2)
+
             rows.append({
                 "from": a, "to": b,
                 "from_tier": tier(A["avg_rssi"]),
                 "to_tier": tier(B["avg_rssi"]),
                 "from_avg": A["avg_rssi"], "to_avg": B["avg_rssi"],
-                "delta": delta, "gap_s": int(gap_s), "weight": round(weight, 2),
+                "from_class": A.get("device_class") or "-",
+                "to_class": B.get("device_class") or "-",
+                "class_match": cmatch,
+                "delta": delta, "gap_s": int(gap_s), "weight": weight,
                 "kind": kind,
             })
 
     # Report: rotations first (tight gap + continuity), then jumps
     rows.sort(key=lambda r: (-(r["kind"] == "ROTATION?"), -r["weight"]))
     if report:
-        print(f"Three-layer handoffs ({len(rows)} pairs):")
-        print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  kind")
-        print("-" * 66)
+        print(f"Three-layer handoffs + class coherence ({len(rows)} pairs):")
+        print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  class       kind")
+        print("-" * 78)
         shown = 0
         for r in rows:
             if r["from_tier"] != "STRONG" or r["to_tier"] != "STRONG":
                 continue  # only STRONG tier resolves entities
-            print(f"{r['from']:<20} {r['to']:<20} {r['delta']:>4} {r['gap_s']:>6} {r['weight']:>5}  {r['kind']}")
+            cm = {"match": "SAME", "mismatch": "DIFF", "-": "-"}[r["class_match"]]
+            print(f"{r['from']:<20} {r['to']:<20} {r['delta']:>4} {r['gap_s']:>6} {r['weight']:>5}  {cm:<10} {r['kind']}")
             shown += 1
             if shown >= 40:
                 break
         if shown == 0:
             print("  (no STRONG-tier handoffs in window)")
     return rows
+
+
+def load_locations():
+    """BSSID → label map (locations.json). 'Location is learned, not claimed.'"""
+    if not os.path.exists(LOCATIONS_FILE):
+        return {}
+    try:
+        with open(LOCATIONS_FILE) as f:
+            return {k.lower(): v for k, v in (json.load(f) or {}).items()}
+    except Exception:
+        return {}
+
+
+def places_view(c):
+    """BSSID registry → PLACE entities.
+
+    A BSSID that never moves (stable RSSI profile) + enough beacon sightings
+    + a meaningful observation span = a PLACE. Labels resolve from
+    locations.json when present (e.g. A8:F5:DD:CA:AC:3C → "home").
+    """
+    ensure_schema(c)
+    wm = WM
+    rows = [dict(r) for r in c.execute(
+        "SELECT * FROM places ORDER BY seen_count DESC")]
+    locations = load_locations()
+
+    places = []
+    for r in rows:
+        variance = (r["max_rssi"] or 0) - (r["min_rssi"] or 0)
+        span_s = 0
+        try:
+            t0 = datetime.fromisoformat(r["first_seen"].replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(r["last_seen"].replace("Z", "+00:00"))
+            span_s = (t1 - t0).total_seconds()
+        except Exception:
+            pass
+        is_place = (r["seen_count"] >= wm["place_min_seen"]
+                    and variance <= wm["place_max_rssi_variance"]
+                    and span_s >= wm["place_min_span_seconds"])
+        if is_place:
+            c.execute("UPDATE places SET stable=1 WHERE bssid=?", (r["bssid"],))
+        label = locations.get(r["bssid"], {}).get("label") if isinstance(locations.get(r["bssid"]), dict) else None
+        places.append({
+            "bssid": r["bssid"], "ssid": r["ssid"] or "?", "channel": r["channel"],
+            "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+            "seen": r["seen_count"], "min": r["min_rssi"], "max": r["max_rssi"],
+            "avg": r["avg_rssi"], "variance": variance,
+            "span_h": round(span_s / 3600, 1),
+            "place": is_place, "label": label,
+        })
+    c.commit()
+    return places
+
+
+def print_places(places):
+    if not places:
+        print("No BSSIDs in the places registry yet — wait for type:\"wifi\" "
+              "beacon envelopes (firmware sends a batch every 5 min).")
+        return
+    print(f"{'PLACE':<6} {'SSID':<20} {'BSSID':<20} {'ch':>3} {'seen':>5} {'rssi':>10} {'var':>4} {'span_h':>6}  label")
+    print("-" * 92)
+    for p in places:
+        mark = "PLACE" if p["place"] else "    "
+        rng = f"{p['min']}..{p['max']}" if p["min"] is not None else "?"
+        print(f"{mark:<6} {(p['ssid'] or '?')[:19]:<20} {p['bssid']:<20} {p['channel'] or '?':>3} "
+              f"{p['seen']:>5} {rng:>10} {p['variance']:>4} {p['span_h']:>6}  {p['label'] or ''}")
+    n_places = sum(1 for p in places if p["place"])
+    print(f"\n{len(places)} BSSIDs in registry, {n_places} resolve to PLACE "
+          f"(seen>={WM['place_min_seen']}, var<={WM['place_max_rssi_variance']}dB, "
+          f"span>={WM['place_min_span_seconds']}s).")
+
+
+def probes_view(c, limit=20):
+    """Probe-request identity log: which client MACs seek which SSIDs.
+
+    A client probing for an SSID registered as a place = a device that KNOWS
+    our network (returning entity) — identity from the air, no connection.
+    """
+    ensure_schema(c)
+    rows = [dict(r) for r in c.execute(
+        """SELECT ssid, COUNT(*) AS n, COUNT(DISTINCT client_mac) AS clients,
+                  GROUP_CONCAT(DISTINCT client_mac) AS macs,
+                  MAX(received_at) AS last_seen
+           FROM probes WHERE ssid IS NOT NULL AND ssid != ''
+           GROUP BY ssid ORDER BY n DESC LIMIT ?""", (limit,))]
+    if not rows:
+        print("No probe requests logged yet — they arrive with type:\"wifi\" "
+              "envelopes (any nearby device seeking a network).")
+        return rows
+    known = {r["ssid"] for r in c.execute("SELECT ssid FROM places WHERE ssid IS NOT NULL")}
+    print(f"{'SSID':<24} {'probes':>6} {'clients':>7}  known-network seekers")
+    print("-" * 76)
+    for r in rows:
+        seek = "RETURNING?" if r["ssid"] in known else ""
+        print(f"{(r['ssid'] or '?')[:23]:<24} {r['n']:>6} {r['clients']:>7}  {seek}")
+        macs = (r["macs"] or "").split(",")[:6]
+        for m in macs:
+            print(f"    └ {m}")
+    return rows
+
+
+def where_view(c, label):
+    """mosaic_where: resolve a place label → BSSIDs → current signal picture."""
+    ensure_schema(c)
+    locations = load_locations()
+    bssids = [b for b, info in locations.items()
+              if isinstance(info, dict) and info.get("label") == label]
+    if not bssids:
+        print(f"No location label '{label}' in {LOCATIONS_FILE}.")
+        return
+    for bssid in bssids:
+        r = c.execute("SELECT * FROM places WHERE bssid=?", (bssid,)).fetchone()
+        if not r:
+            print(f"  {bssid} ({label}): no beacon sightings yet")
+            continue
+        print(f"  {bssid} ({label}) — ssid={r['ssid']} ch={r['channel']} "
+              f"seen={r['seen_count']} rssi={r['min_rssi']}..{r['max_rssi']} "
+              f"avg={r['avg_rssi']} last={r['last_seen']} "
+              f"{'PLACE' if r['stable'] else 'not-yet-place'}")
 
 
 def main():
@@ -324,6 +559,9 @@ def main():
     ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
     ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
     ap.add_argument("--chains", action="store_true", help="collapse handoffs into entity chains")
+    ap.add_argument("--places", action="store_true", help="BSSID registry → PLACE entities")
+    ap.add_argument("--probes", action="store_true", help="probe-request identity log")
+    ap.add_argument("--where", metavar="LABEL", help="resolve a place label via BSSIDs")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
 
@@ -341,7 +579,14 @@ def main():
         analyze_handoffs(c, args.hours)
     if args.chains:
         print_chains(c, args.hours)
-    if not (args.status or args.devices or args.seed_labels or args.bind_slots or args.handoffs or args.chains):
+    if args.places:
+        print_places(places_view(c))
+    if args.probes:
+        probes_view(c)
+    if args.where:
+        where_view(c, args.where)
+    if not (args.status or args.devices or args.seed_labels or args.bind_slots
+            or args.handoffs or args.chains or args.places or args.probes or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 

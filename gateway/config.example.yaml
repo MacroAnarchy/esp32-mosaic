@@ -57,3 +57,19 @@ world_model:
   # location fingerprint), downgrade to AMBIGUOUS after this many
   # consecutive moving sightings.
   reclassify_after_moves: 3
+
+  # Class coherence (BLE): the SAME device_class at the SAME RSSI level is
+  # much stronger evidence of one rotating entity (FindMy/Meta accessories
+  # keep their class across MAC rotation). DIFFERENT classes at one level are
+  # different devices — a phone and an AirTag at -62 dB are NOT one entity.
+  # Multipliers apply to the rotation-binding weight in mosaic_brain.py.
+  # Recognized classes: findmy, meta, flipper ("unknown" carries no identity).
+  class_match_multiplier: 1.5
+  class_mismatch_penalty: 0.3
+
+  # WiFi places registry (type:"wifi" beacon frames → BSSID table):
+  # a BSSID becomes a PLACE entity when it has enough sightings, a stable
+  # RSSI profile (it "never moves"), and a meaningful observation span.
+  place_min_seen: 3
+  place_max_rssi_variance: 6
+  place_min_span_seconds: 86400   # 24h, default
