@@ -29,6 +29,50 @@ DATA_DIR = os.path.expanduser("~/.orb")
 LOG_FILE = os.path.join(DATA_DIR, "presence.jsonl")
 DB_FILE = os.path.join(DATA_DIR, "orb.db")
 
+# Default world-model tuning (overridden by config.yaml when present)
+DEFAULT_WORLD_MODEL = {
+    "rssi_floor": -85,
+    "stationary_min_seconds": 604800,
+    "stationary_max_rssi_variance": 8,
+    "visit_absence_gap_seconds": 300,
+    "composite_min_consistency": 0.8,
+    "composite_presence_threshold": 0.33,
+    "reclassify_after_moves": 3,
+}
+
+
+def load_config():
+    """Load config.yaml next to this script. Returns (server, world_model, token).
+    Falls back to defaults when config.yaml is missing — the gateway must
+    always start, even on a fresh clone."""
+    cfg = {}
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "config.yaml")
+    if os.path.exists(path):
+        try:
+            import yaml
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+        except ImportError:
+            print("WARN: PyYAML not installed, using defaults (pip install pyyaml)")
+        except Exception as e:
+            print(f"WARN: config.yaml unreadable ({e}), using defaults")
+
+    server = {
+        "host": cfg.get("host", HOST),
+        "port": int(cfg.get("port", DEFAULT_PORT)),
+        "data_dir": os.path.expanduser(cfg.get("data_dir", DATA_DIR)),
+    }
+    server["log_file"] = os.path.join(server["data_dir"], cfg.get("log_file", "presence.jsonl"))
+    server["db_file"] = os.path.join(server["data_dir"], cfg.get("db_file", "orb.db"))
+
+    wm = dict(DEFAULT_WORLD_MODEL)
+    wm_cfg = cfg.get("world_model", {}) or {}
+    wm.update({k: v for k, v in wm_cfg.items() if v is not None})
+
+    token = cfg.get("ingest_token", "") or ""
+    return server, wm, token
+
 VALID_TYPES = {"scan", "csi", "imu", "state"}
 
 # ---------------------------------------------------------------------------
@@ -142,9 +186,20 @@ class DB:
 # ---------------------------------------------------------------------------
 
 class Gateway:
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        self.db = DB(DB_FILE)
+    def __init__(self, server=None, world_model=None, ingest_token=""):
+        server = server or {
+            "host": HOST,
+            "port": DEFAULT_PORT,
+            "data_dir": DATA_DIR,
+            "log_file": LOG_FILE,
+            "db_file": DB_FILE,
+        }
+        self.server = server
+        self.world_model = world_model or dict(DEFAULT_WORLD_MODEL)
+        self.ingest_token = ingest_token
+        os.makedirs(server["data_dir"], exist_ok=True)
+        self.log_file = server["log_file"]
+        self.db = DB(server["db_file"])
         self.subscribers = set()  # WebSocket clients
 
     def stamp(self, envelope, source_ip):
@@ -180,7 +235,7 @@ class Gateway:
         if err:
             return 400, {"error": err}
         # Canonical JSONL log (source of truth)
-        with open(LOG_FILE, "a") as f:
+        with open(self.log_file, "a") as f:
             f.write(json.dumps(rec) + "\n")
         # SQLite
         try:
@@ -242,18 +297,25 @@ class Gateway:
 
 def main():
     ap = argparse.ArgumentParser(description="ORB Protocol v1 gateway")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--port", type=int, default=None, help="override config.yaml port")
     args = ap.parse_args()
 
-    gw = Gateway()
+    server, world_model, token = load_config()
+    if args.port:
+        server["port"] = args.port
+
+    gw = Gateway(server)
+    gw.world_model = world_model
+    gw.ingest_token = token
     app = web.Application()
     app.router.add_post("/orb/ingest", gw.handle_ingest)
     app.router.add_get("/ws", gw.handle_ws)
     app.router.add_get("/status", gw.handle_status)
     app.router.add_get("/", gw.handle_status)
 
-    print(f"ORB gateway v1 on :{args.port} (log={LOG_FILE}, db={DB_FILE})")
-    web.run_app(app, host=HOST, port=args.port)
+    print(f"ORB gateway v1 on :{server['port']} (log={server['log_file']}, db={server['db_file']})")
+    print(f"world_model: {json.dumps(world_model)}")
+    web.run_app(app, host=server["host"], port=server["port"])
 
 
 if __name__ == "__main__":

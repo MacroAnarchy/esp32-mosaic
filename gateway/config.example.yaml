@@ -5,6 +5,7 @@
 #
 #   cp config.example.yaml config.yaml
 
+# --- Server ---
 # Bind address (0.0.0.0 = all interfaces)
 host: 0.0.0.0
 port: 9000
@@ -19,3 +20,40 @@ db_file: orb.db
 # Optional: shared auth token for ingest. Leave empty for no auth.
 # If set, nodes must send header "X-Mosaic-Token: <token>".
 ingest_token: ""
+
+# --- World model tuning (static for now — tuned the hard way) ---
+#
+# These are the analysis-layer thresholds. They stay STATIC in config
+# until real data teaches us better values. No dynamic anything yet.
+world_model:
+  # RSSI floor: below this, a signal is treated as neighbor bleed / noise
+  # and not counted for entity resolution. (e.g. -85 = through a wall)
+  rssi_floor: -85
+
+  # How long (seconds) a device must be seen consistently in one place
+  # before AMBIGUOUS can resolve to PLACE (stationary entity).
+  stationary_min_seconds: 604800   # 7 days, default
+
+  # RSSI variance (dB) over the stationary window that still counts as
+  # "not moving". Above this = movement evidence.
+  stationary_max_rssi_variance: 8
+
+  # Retroactive visit grouping: if a device is absent for less than this
+  # gap (seconds), it's still the SAME visit (continuity of presence).
+  # Gaps above this split visits. NOTE: retroactive by design — the
+  # threshold is the ABSENCE that proves a break, not an arbitrary timer.
+  visit_absence_gap_seconds: 300
+
+  # Composite binding: minimum co-occurrence consistency (0.0-1.0) before
+  # two leaf entities are treated as one composite (e.g. phone + watch = the owner).
+  composite_min_consistency: 0.8
+
+  # Entity confidence: fraction of expected leaves seen in one window that
+  # counts as "composite is present". 0.33 = any one of three devices implies
+  # the person is here (branch implies trunk).
+  composite_presence_threshold: 0.33
+
+  # Reclassification: if a PLACE entity moves (appears in a different
+  # location fingerprint), downgrade to AMBIGUOUS after this many
+  # consecutive moving sightings.
+  reclassify_after_moves: 3
