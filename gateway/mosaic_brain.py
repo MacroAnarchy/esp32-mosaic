@@ -141,7 +141,66 @@ def print_entity_view(rows, limit=40):
         print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['avg']:>5} {r['spread']:>4} {r['n']:>5}  {r['mac']} {mark}")
 
 
-def analyze_handoffs(c, hours=24):
+def collapse_chains(rows, min_weight=0.7):
+    """Turn pairwise rotation binds into transitive chains.
+
+    A→B, B→C, C→D (each a rotation bind above min_weight) = ONE chain = ONE
+    entity slot. Union-find over the bind graph. Returns list of chains,
+    each = ordered list of MACs (by first appearance).
+    """
+    # Only rotation binds (continuity) with sufficient time-decay weight
+    edges = [(r["from"], r["to"], r["weight"]) for r in rows
+             if r["kind"] == "ROTATION?" and r["weight"] >= min_weight]
+
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for a, b, _w in edges:
+        union(a, b)
+
+    # Group by root, preserve first-seen order within chain
+    chains = {}
+    for a, b, w in edges:
+        root = find(a)
+        chains.setdefault(root, set()).add(a)
+        chains.setdefault(root, set()).add(b)
+
+    ordered = []
+    for root, macs in chains.items():
+        if len(macs) < 2:
+            continue
+        # order by first appearance in the sighting stream (approx: sort MACs)
+        ordered.append(sorted(macs))
+    return ordered
+
+
+def print_chains(c, hours=24):
+    rows = analyze_handoffs(c, hours, report=False)
+    chains = collapse_chains(rows)
+    print(f"\nENTITY CHAINS ({len(chains)} from {len(rows)} handoff pairs):")
+    print("-" * 70)
+    for chain in sorted(chains, key=len, reverse=True):
+        # Look up labels for the first MAC
+        lbl = ""
+        cur = c.execute("SELECT label FROM devices WHERE mac=?", (chain[0],))
+        r = cur.fetchone()
+        if r and r["label"]:
+            lbl = f" [{r['label']}]"
+        print(f"  Entity{lbl}: {len(chain)} MACs in slot")
+        print(f"    {' → '.join(m[:8] for m in chain[:12])}{' …' if len(chain) > 12 else ''}")
+    return chains
+
+
+def analyze_handoffs(c, hours=24, report=True):
     """Three-layer handoff analysis (data association in RSSI space).
 
     LAYER 1 — TIER: signal quality floor. STRONG resolves, EDGE counts only.
@@ -231,19 +290,20 @@ def analyze_handoffs(c, hours=24):
 
     # Report: rotations first (tight gap + continuity), then jumps
     rows.sort(key=lambda r: (-(r["kind"] == "ROTATION?"), -r["weight"]))
-    print(f"Three-layer handoffs ({len(rows)} pairs):")
-    print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  kind")
-    print("-" * 66)
-    shown = 0
-    for r in rows:
-        if r["from_tier"] != "STRONG" or r["to_tier"] != "STRONG":
-            continue  # only STRONG tier resolves entities
-        print(f"{r['from']:<20} {r['to']:<20} {r['delta']:>4} {r['gap_s']:>6} {r['weight']:>5}  {r['kind']}")
-        shown += 1
-        if shown >= 40:
-            break
-    if shown == 0:
-        print("  (no STRONG-tier handoffs in window)")
+    if report:
+        print(f"Three-layer handoffs ({len(rows)} pairs):")
+        print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  kind")
+        print("-" * 66)
+        shown = 0
+        for r in rows:
+            if r["from_tier"] != "STRONG" or r["to_tier"] != "STRONG":
+                continue  # only STRONG tier resolves entities
+            print(f"{r['from']:<20} {r['to']:<20} {r['delta']:>4} {r['gap_s']:>6} {r['weight']:>5}  {r['kind']}")
+            shown += 1
+            if shown >= 40:
+                break
+        if shown == 0:
+            print("  (no STRONG-tier handoffs in window)")
     return rows
 
 
@@ -254,6 +314,7 @@ def main():
     ap.add_argument("--seed-labels", action="store_true", help="import owner_devices.json")
     ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
     ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
+    ap.add_argument("--chains", action="store_true", help="collapse handoffs into entity chains")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
 
@@ -269,7 +330,9 @@ def main():
         print_entity_view(entity_view(c, args.hours))
     if args.bind_slots or args.handoffs:
         analyze_handoffs(c, args.hours)
-    if not (args.status or args.devices or args.seed_labels or args.bind_slots or args.handoffs):
+    if args.chains:
+        print_chains(c, args.hours)
+    if not (args.status or args.devices or args.seed_labels or args.bind_slots or args.handoffs or args.chains):
         print_entity_view(entity_view(c, args.hours))
 
 
