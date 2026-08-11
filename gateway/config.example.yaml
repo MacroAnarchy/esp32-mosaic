@@ -109,3 +109,12 @@ world_model:
   # preceding same-level '-' stream as an ancestor slot (MAC set merged,
   # absence computed from real presence) when the gap is within this cap.
   lockstep_resurrect_max_gap_seconds: 21600  # 6h: evening-out departures
+
+  # Owner presence (M1: 'is the owner home?'): explicitly labeled owner
+  # seeds (devices table) are traced through entity chains to their current
+  # rotating MAC. owner_label_prefix selects the seeds — set it to your
+  # deployment's label namespace. owner_present_seconds = slot activity
+  # within this counts as PRESENT (10 min covers scan gaps and still goes
+  # stale crisply when the person walks out with the device).
+  owner_label_prefix: OWNER_        # set to your deployment's label namespace
+  owner_present_seconds: 600        # 10 min, default

@@ -20,6 +20,7 @@ Usage:
   python3 mosaic_brain.py --chains          # class-weighted entity chains
   python3 mosaic_brain.py --places          # BSSID registry → PLACE entities
   python3 mosaic_brain.py --probes          # probe-request identity log
+  python3 mosaic_brain.py --owner           # M1: is the owner home? (seed→chain resolution)
   python3 mosaic_brain.py --backfill-beacons  # rebuild beacon_samples from events
   python3 mosaic_brain.py --where "home"    # resolve a place label via BSSIDs
 """
@@ -44,6 +45,27 @@ LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
 # payloads). Normalize the stored column to SQLite's format before comparing.
 # Use via: WHERE {TS_WINDOW}   (add the alias prefix for correlated subqueries)
 TS_WINDOW = "REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)"
+
+
+def _parse_ts(iso):
+    """Parse any stored ISO timestamp into an AWARE UTC datetime.
+
+    The DB mixes formats: legacy/test-era rows carry naive
+    'YYYY-MM-DDTHH:MM:SS' (no offset), newer rows carry '+00:00'. Comparing
+    naive vs aware datetimes raises TypeError — which crashed full-history
+    chain passes (24h windows never touched the old rows). Normalize
+    everything to aware UTC.
+    """
+    if not iso:
+        return None
+    s = iso.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 # Tuning (static for now — tuned the hard way, see gateway config)
 # NOTE: spread is now ROBUST p10-p90 (not raw max-min). A single deep-fade
@@ -114,6 +136,15 @@ DEFAULT_WM = {
     # real presence. 6h covers evening-out departures; a full workday away
     # stays unbridged until data shows it is safe.
     "lockstep_resurrect_max_gap_seconds": 21600,
+    # Owner presence (Aug 11): the M1 resolver ('is the owner home?') traces
+    # explicitly labeled owner seeds (devices table, label prefix below)
+    # through entity chains to their current active identity. Prefix is
+    # deployment-local (the live config.yaml sets the real one); the repo
+    # ships a neutral example. owner_present_seconds = slot activity within
+    # this = PRESENT (the desk phone is seen every ~20s scan; 10 min covers
+    # scan gaps while staying crisp for a person walking out).
+    "owner_label_prefix": "OWNER_",
+    "owner_present_seconds": 600,
 }
 
 
@@ -369,6 +400,125 @@ def print_entity_view(rows, limit=40):
     print(f"  {summary}  (of {len(rows)} devices; spr = robust p10-p90 spread, raw = max-min)")
 
 
+# --- OWNER PRESENCE (M1) ----------------------------------------------------
+# 'Is the owner home?' — the killer question. Labeled owner BLE MACs rotate,
+# so a seed MAC goes stale while the object is still here (the Aug-9 binding
+# was 46h before today's streams). Resolution: trace the seed through its
+# ENTITY SLOT (full-history chain) to the slot's most recent member = the
+# object's current identity; presence = slot activity. When the seed slot is
+# stale but an active STRONG device sits at the seed's signal level, surface
+# it as an OWNER-SHAPED CANDIDATE: visible but NOT bound — labels are earned,
+# and the WiFi-join correlation (the documented rebind path) is confirmation.
+
+def owner_view(c, hours=24, report=True):
+    """M1 resolver: owner presence through entity chains."""
+    ensure_schema(c)
+    prefix = WM.get("owner_label_prefix", "OWNER_")
+    seeds = [dict(r) for r in c.execute(
+        "SELECT mac, label, note FROM devices WHERE label LIKE ?",
+        (prefix + "%",))]
+    if not seeds:
+        if report:
+            print(f"OWNER: no seeded owner labels (devices label prefix '{prefix}'). "
+                  "Seed via --seed-labels, then labels propagate here.")
+        return []
+    # Resolve against full history: seeds may predate the status window.
+    rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
+    chains = collapse_chains(rows, macs)
+    slot_of = {}
+    for ch in chains:
+        for m in ch:
+            slot_of[m] = ch
+    present_s = WM.get("owner_present_seconds", 600)
+    level_gate = WM.get("stream_level_gate", 4)
+    now = datetime.now(timezone.utc)
+
+    out = []
+    for s in seeds:
+        mac = s["mac"]
+        row = {"label": s["label"], "seed": mac}
+        info = macs.get(mac)
+        if info is None:
+            row["state"] = "UNSEEN"
+            row["detail"] = ("never sighted by the BLE sniffer (WiFi-only identity — "
+                             "resolve via WiFi-join correlation)")
+            out.append(row)
+            continue
+        slot = slot_of.get(mac)
+        # Level anchor: the slot's mean level, or the seed's own mean when
+        # the seed never joined a chain (isolated legacy MAC).
+        if slot:
+            mem = [macs[m] for m in slot if m in macs]
+            mem.sort(key=lambda m: m["first_ts"])
+            anchor_avg = sum(m["avg_rssi"] for m in mem) / len(mem)
+            active = max(mem, key=lambda m: m["last_ts"])
+            last_dt = _parse_ts(active["last_ts"])
+            row["slot_n"] = len(slot)
+            row["anchor_avg"] = round(anchor_avg, 1)
+            row["active_mac"] = active["mac"]
+            row["active_avg"] = active["avg_rssi"]
+        else:
+            anchor_avg = info["avg_rssi"]
+            last_dt = _parse_ts(info["last_ts"])
+            row["slot_n"] = 1
+            row["anchor_avg"] = round(anchor_avg, 1)
+            row["active_mac"] = mac
+            row["active_avg"] = info["avg_rssi"]
+        if last_dt is None:
+            row["state"] = "UNRESOLVED"
+            row["detail"] = "unparseable timestamps — cannot resolve"
+            out.append(row)
+            continue
+        age = (now - last_dt).total_seconds()
+        row["age_s"] = age
+        if age <= present_s:
+            row["state"] = "PRESENT"
+            row["detail"] = (f"slot active {int(age)}s ago via {row['active_mac']} "
+                             f"@ {row['active_avg']:.1f} dB (slot {row['slot_n']} MACs, "
+                             f"level {row['anchor_avg']})")
+        else:
+            row["state"] = "STALE"
+            row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac'][:8]}…, "
+                             f"level {row['anchor_avg']})")
+            # owner-shaped candidate: active STRONG device at the seed level,
+            # not part of the seed's own slot. Reported, never auto-bound.
+            cands = []
+            for m in macs.values():
+                if m["mac"] in (slot or [mac]):
+                    continue
+                if tier_of(m["avg_rssi"]) != "STRONG":
+                    continue
+                if abs(m["avg_rssi"] - anchor_avg) > level_gate:
+                    continue
+                cd = _parse_ts(m["last_ts"])
+                if cd is None or (now - cd).total_seconds() > present_s:
+                    continue
+                cands.append(m)
+            cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
+            if cands:
+                m = cands[0]
+                cd = (now - _parse_ts(m["last_ts"])).total_seconds()
+                row["candidate"] = (f"{m['mac']} @ {m['avg_rssi']:.1f} dB "
+                                    f"(Δ{abs(m['avg_rssi']-anchor_avg):.1f}) "
+                                    f"co={m['company_id'] or '-'} last {int(cd)}s ago "
+                                    f"— owner-shaped, unbound")
+        out.append(row)
+    if report:
+        print_owner_view(out)
+    return out
+
+
+def print_owner_view(out):
+    print("\nOWNER — seeded identity presence (resolved through entity chains):")
+    print("-" * 78)
+    for r in out:
+        print(f"  {r['label']:<24} {r['state']:<10} {r['detail']}")
+        if r.get("candidate"):
+            print(f"{'':<24} {'':<10} └ candidate: {r['candidate']}")
+    print("  PRESENT = slot active ≤ 10min · candidate = unlabeled STRONG device at "
+          "seed level (unbound until WiFi-join confirmation)")
+
+
 def collapse_chains(rows, macs=None, min_weight=0.7):
     """Turn pairwise rotation binds into transitive chains.
 
@@ -410,9 +560,8 @@ def collapse_chains(rows, macs=None, min_weight=0.7):
         claimed = {a for a, _b, _w in edges}  # MACs already bound as predecessor
         ordered = sorted(macs.values(), key=lambda m: m["first_ts"])
         for B in ordered:
-            try:
-                t_b = datetime.fromisoformat(B["first_ts"].replace("Z", "+00:00"))
-            except Exception:
+            t_b = _parse_ts(B["first_ts"])
+            if t_b is None:
                 continue
             best, best_key = None, None
             for A in ordered:
@@ -428,10 +577,10 @@ def collapse_chains(rows, macs=None, min_weight=0.7):
                 # the company filter below is what keeps parallel identities
                 # apart.
                 try:
-                    t_a = datetime.fromisoformat(A["last_ts"].replace("Z", "+00:00"))
+                    t_a = _parse_ts(A["last_ts"])
                 except Exception:
                     continue
-                if t_a > t_b:
+                if t_a is None or t_a > t_b:
                     continue
                 gap = (t_b - t_a).total_seconds()
                 if gap > max_gap:
@@ -520,11 +669,13 @@ def _chain_meta(macs, chain):
         return None
     mem.sort(key=lambda m: m["first_ts"])
     avg = sum(m["avg_rssi"] for m in mem) / len(mem)
-    span_s = (datetime.fromisoformat(mem[-1]["last_ts"].replace("Z", "+00:00"))
-              - datetime.fromisoformat(mem[0]["first_ts"].replace("Z", "+00:00"))).total_seconds()
+    t_first, t_last = _parse_ts(mem[0]["first_ts"]), _parse_ts(mem[-1]["last_ts"])
+    span_s = (t_last - t_first).total_seconds() if t_first and t_last else 0
     events = []
     for m in mem[1:]:
-        events.append(datetime.fromisoformat(m["first_ts"].replace("Z", "+00:00")))
+        t = _parse_ts(m["first_ts"])
+        if t is not None:
+            events.append(t)
     gaps = [(b - a).total_seconds() for a, b in zip(events[:-1], events[1:])]
     cadence = sorted(gaps)[len(gaps) // 2] if gaps else None
     company = next((m["company_id"] for m in mem if m["company_id"]), None)
@@ -668,8 +819,10 @@ def lockstep_pairs(c, hours=24, report=True):
     mac_minutes = {}
     global_minutes = set()
     for mac, minute in cur.fetchall():
-        mac_minutes.setdefault(mac, set()).add(datetime.fromisoformat(minute))
-        global_minutes.add(datetime.fromisoformat(minute))
+        t = _parse_ts(minute)
+        if t is not None:
+            mac_minutes.setdefault(mac, set()).add(t)
+            global_minutes.add(t)
     for m in metas:
         m["gaps"] = _chain_gaps(mac_minutes, m["chain"], gap_min)
 
@@ -692,7 +845,9 @@ def lockstep_pairs(c, hours=24, report=True):
     inheritors = {}
     if resurrect_max > 0:
         def _p(iso):
-            return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            t = _parse_ts(iso)
+            # unparseable → epoch sentinel so ordering comparisons stay safe
+            return t if t is not None else datetime.min.replace(tzinfo=timezone.utc)
         legacy = [s for s in streams if s.get("company") is None]
         for s in streams:
             if s.get("company") is None:
@@ -1178,6 +1333,8 @@ def main():
                     help="detect parallel-identity objects (chains rotating in lockstep)")
     ap.add_argument("--places", action="store_true", help="BSSID registry → PLACE entities")
     ap.add_argument("--probes", action="store_true", help="probe-request identity log")
+    ap.add_argument("--owner", action="store_true",
+                    help="M1: owner presence — resolve seeded owner labels through entity chains")
     ap.add_argument("--backfill-beacons", action="store_true",
                     help="rebuild beacon_samples from events JSON history")
     ap.add_argument("--where", metavar="LABEL", help="resolve a place label via BSSIDs")
@@ -1193,7 +1350,10 @@ def main():
         for r in c.execute("SELECT mac, label, stable FROM devices ORDER BY stable DESC"):
             print(f"{'*' if r['stable'] else ' '} {r['mac']}  {r['label']}")
     if args.status:
+        owner_view(c, args.hours)          # M1 first: 'is the owner home?'
         print_entity_view(entity_view(c, args.hours))
+    if args.owner:
+        owner_view(c, args.hours)
     if args.bind_slots or args.handoffs:
         analyze_handoffs(c, args.hours)
     if args.chains:
@@ -1210,7 +1370,7 @@ def main():
         where_view(c, args.where)
     if not (args.status or args.devices or args.seed_labels or args.bind_slots
             or args.handoffs or args.chains or args.lockstep or args.places
-            or args.probes or args.backfill_beacons or args.where):
+            or args.probes or args.owner or args.backfill_beacons or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 
