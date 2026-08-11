@@ -16,9 +16,12 @@ Every ESP32 scanner shows you devices and forgets them. Mosaic **remembers**:
 it learns the radio fingerprint of places, clusters devices into entities,
 and derives meaning from patterns over time. The remembering radar.
 
-The model is passive, local and private: no cameras, no microphones, no cloud.
-It listens to the radio that's already around you and builds understanding
-from it — then exposes that understanding to whatever you want to use it for.
+The project's goal is the **maximum technically possible** on cheap,
+always-on hardware: a passive RF observer that turns a 3€ chip's radio into a
+real understanding of a space. The model is local and private — no cameras,
+no microphones, no cloud. It listens to the radio that's already around you
+and builds understanding from it, then exposes that understanding to whatever
+you want to use it for.
 
 ## Use cases
 
