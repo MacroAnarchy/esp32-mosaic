@@ -36,6 +36,23 @@ DB = os.path.expanduser("~/.orb/orb.db")
 # stored column before comparing.
 TS_WINDOW = "REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)"
 
+# Movement-class thresholds — ROBUST p10-p90 spread (same as mosaic_brain):
+# raw max-min lets one deep-fade sample (-106) flip a stationary AirTag to
+# MOVING. p10-p90 trims the tails. Keep in sync with mosaic_brain.py.
+STATIONARY_MAX_SPREAD = 15
+MOVING_MIN_SPREAD = 25
+SPREAD_MIN_SAMPLES = 10
+
+
+def robust_spread(vals):
+    if len(vals) < SPREAD_MIN_SAMPLES:
+        return max(vals) - min(vals)
+    s = sorted(vals)
+    n = len(s)
+    lo = s[max(0, int(n * 0.10) - 1)]
+    hi = s[min(n - 1, int(n * 0.90) - 1)]
+    return hi - lo
+
 
 def conn():
     c = sqlite3.connect(DB)
@@ -60,13 +77,23 @@ def tools():
         SELECT mac,
                MIN(rssi) AS min_rssi, MAX(rssi) AS max_rssi,
                ROUND(AVG(rssi),1) AS avg_rssi,
-               (MAX(rssi)-MIN(rssi)) AS spread,
+               (MAX(rssi)-MIN(rssi)) AS spread_raw,
                COUNT(*) AS n, MAX(name) AS name
         FROM sightings
         WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
         GROUP BY mac HAVING n >= 3
         """, (f"-{hours} hours",))
         rows = _rows_to_dicts(cur.fetchall())
+
+        # Robust spread per device (p10-p90) — one deep-fade sample must not
+        # flip a stationary device to MOVING.
+        for r in rows:
+            vals = [v[0] for v in c.execute(
+                "SELECT rssi FROM sightings WHERE mac=? "
+                "AND REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?) "
+                "ORDER BY rssi", (r["mac"], f"-{hours} hours"))]
+            r["spread"] = robust_spread(vals)
+            r["spread_raw"] = r.pop("spread_raw")
 
         def tier(avg):
             if avg >= -70:
@@ -76,9 +103,9 @@ def tools():
             return "EDGE"
 
         def move_class(spread):
-            if spread <= 15:
+            if spread <= STATIONARY_MAX_SPREAD:
                 return "STATIC"
-            if spread >= 30:
+            if spread >= MOVING_MIN_SPREAD:
                 return "MOVING"
             return "AMBI"
 
@@ -122,7 +149,7 @@ def tools():
         cur = c.execute("""
         SELECT mac, MIN(rssi) AS min_rssi, MAX(rssi) AS max_rssi,
                ROUND(AVG(rssi),1) AS avg_rssi,
-               (MAX(rssi)-MIN(rssi)) AS spread,
+               (MAX(rssi)-MIN(rssi)) AS spread_raw,
                COUNT(*) AS n, MAX(name) AS name,
                MAX(received_at) AS last_seen
         FROM sightings
@@ -132,7 +159,14 @@ def tools():
         AND REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
         GROUP BY mac ORDER BY n DESC LIMIT 20
         """, (q, q, q, q, f"-{hours} hours"))
-        return json.dumps(_rows_to_dicts(cur.fetchall()), indent=1)
+        rows = _rows_to_dicts(cur.fetchall())
+        for r in rows:
+            vals = [v[0] for v in c.execute(
+                "SELECT rssi FROM sightings WHERE mac=? "
+                "AND REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?) "
+                "ORDER BY rssi", (r["mac"], f"-{hours} hours"))]
+            r["spread"] = robust_spread(vals) if vals else r.pop("spread_raw")
+        return json.dumps(rows, indent=1)
 
     @mcp.tool()
     def nodes() -> str:

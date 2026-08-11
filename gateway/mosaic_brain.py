@@ -46,9 +46,16 @@ LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
 TS_WINDOW = "REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)"
 
 # Tuning (static for now — tuned the hard way, see gateway config)
-STATIONARY_MAX_SPREAD = 15   # dB: below this = stationary (data: Aqara 12, Philips 12)
-MOVING_MIN_SPREAD = 30       # dB: above this = clearly moving (data: PAX 38, watch 46)
-MUTED_SPREAD = 25            # dB: above this = location evidence muted
+# NOTE: spread is now ROBUST p10-p90 (not raw max-min). A single deep-fade
+# sample (-106 in a -58..-66 cluster) previously flipped a stationary AirTag
+# to MOVING. Thresholds anchored on live data:
+#   STATIC  <= 15  (Aqara 3, ThermoBeacon 14, findmy cluster 5-8)
+#   MOVING  >= 25  (anchor: cd:c4:ba genuine excursion reads 23.6 → 25 catches it)
+#   MUTED   >= 20  (any real mover must mute its location evidence)
+STATIONARY_MAX_SPREAD = 15   # dB: below this = stationary (robust p10-p90)
+MOVING_MIN_SPREAD = 25       # dB: above this = moving (robust p10-p90)
+MUTED_SPREAD = 20            # dB: above this = location evidence muted
+SPREAD_MIN_SAMPLES = 10      # below this, p10-p90 is unreliable → fall back to raw
 CO_OCCUR_BIND_SECONDS = 120  # new MAC seen within this of an anchor = slot candidate
 CO_OCCUR_LEVEL_GATE = 8      # dB: same-entity rotation keeps signal level (data: -62 cluster ±3)
 
@@ -179,14 +186,36 @@ def seed_labels(c):
     print(f"Seeded {len(labels)} device labels")
 
 
+def robust_spread(vals):
+    """p10-p90 of a sorted RSSI sample list — outlier-proof spread.
+
+    Raw max-min lets ONE deep-fade sample (-106 in a -58..-66 cluster)
+    flip a stationary AirTag to MOVING. The p10-p90 range trims the tails:
+    same medicine as the PLACE gate (places_view). Falls back to raw
+    max-min when there are too few samples for percentiles to mean anything.
+    """
+    if len(vals) < SPREAD_MIN_SAMPLES:
+        return max(vals) - min(vals)
+    s = sorted(vals)
+    n = len(s)
+    lo = s[max(0, int(n * 0.10) - 1)]
+    hi = s[min(n - 1, int(n * 0.90) - 1)]
+    return hi - lo
+
+
 def device_stats(c, hours=24):
-    """Per-device RSSI stats over the window, plus the latest device_class."""
+    """Per-device RSSI stats over the window, plus the latest device_class.
+
+    spread = ROBUST p10-p90 (max-min is outlier-poisoned: one deep-fade
+    sample flips a stationary device to MOVING). raw spread kept for the
+    display so both numbers are visible.
+    """
     cur = c.execute("""
     SELECT mac,
            MIN(rssi) AS min_rssi,
            MAX(rssi) AS max_rssi,
            ROUND(AVG(rssi),1) AS avg_rssi,
-           (MAX(rssi)-MIN(rssi)) AS spread,
+           (MAX(rssi)-MIN(rssi)) AS spread_raw,
            COUNT(*) AS n,
            MAX(name) AS name,
            MAX(s.received_at) AS last_seen,
@@ -197,9 +226,21 @@ def device_stats(c, hours=24):
     WHERE REPLACE(substr(s.received_at,1,19),'T',' ') > datetime('now', ?)
     GROUP BY mac
     HAVING n >= 3
-    ORDER BY spread DESC
     """, (f"-{hours} hours",))
-    return cur.fetchall()
+    rows = [dict(r) for r in cur.fetchall()]
+
+    # Robust spread pass: fetch each device's sample list in one go.
+    # (Percentiles can't be computed in the aggregate query, so pull the
+    # raw values per MAC and reduce in Python.)
+    for r in rows:
+        vals = [v[0] for v in c.execute(
+            "SELECT rssi FROM sightings WHERE mac=? "
+            "AND REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?) "
+            "ORDER BY rssi", (r["mac"], f"-{hours} hours"))]
+        r["spread"] = robust_spread(vals)
+
+    rows.sort(key=lambda r: r["spread"], reverse=True)
+    return rows
 
 
 def entity_view(c, hours=24):
@@ -238,7 +279,7 @@ def entity_view(c, hours=24):
             "label": label,
             "stable": stable,
             "min": s["min_rssi"], "max": s["max_rssi"], "avg": s["avg_rssi"],
-            "spread": s["spread"], "n": s["n"],
+            "spread": s["spread"], "spread_raw": s["spread_raw"], "n": s["n"],
             "class": move_class, "muted": muted,
             "dclass": dclass or "-",
             "place_candidate": dclass == "findmy" and move_class == "STATIC",
@@ -250,13 +291,14 @@ def print_entity_view(rows, limit=40):
     if not rows:
         print("No data in window (need >=3 sightings per device).")
         return
-    print(f"{'LABEL':<26} {'class':<7} {'dclass':<9} {'avg':>5} {'spr':>4} {'n':>5}  mac")
-    print("-" * 88)
+    print(f"{'LABEL':<26} {'class':<7} {'dclass':<9} {'avg':>5} {'spr':>4} {'raw':>4} {'n':>5}  mac")
+    print("-" * 96)
     for r in rows[:limit]:
         mark = "MUTED" if r["muted"] else ""
         stable_m = "*" if r["stable"] else " "
         pc = "PLACE?" if r["place_candidate"] else ""
-        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['n']:>5}  {r['mac']} {mark} {pc}")
+        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['spread_raw']:>4} {r['n']:>5}  {r['mac']} {mark} {pc}")
+    print("  spr = robust p10-p90 spread (outlier-proof); raw = max-min")
 
 
 def collapse_chains(rows, min_weight=0.7):
