@@ -140,12 +140,23 @@ CREATE TABLE IF NOT EXISTS probes (
     channel     INTEGER,
     rssi        INTEGER
 );
+-- Per-beacon RSSI samples: the raw evidence behind the places registry.
+-- The brain computes PLACE stability from a RECENT window of these samples
+-- (robust p10-p90 spread), NOT from monotonic all-time min/max — a single
+-- outlier beacon would otherwise permanently disqualify a stable place.
+CREATE TABLE IF NOT EXISTS beacon_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bssid       TEXT,
+    received_at TEXT,
+    rssi        INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_sightings_mac ON sightings(mac);
 CREATE INDEX IF NOT EXISTS idx_sightings_time ON sightings(received_at);
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(node_id);
 CREATE INDEX IF NOT EXISTS idx_places_last_seen ON places(last_seen);
 CREATE INDEX IF NOT EXISTS idx_probes_ssid ON probes(ssid);
 CREATE INDEX IF NOT EXISTS idx_probes_mac ON probes(client_mac);
+CREATE INDEX IF NOT EXISTS idx_beacon_samples_bssid ON beacon_samples(bssid, received_at);
 """
 
 # Columns added after the original v1 schema shipped — ALTERed in on existing
@@ -228,21 +239,29 @@ class DB:
                                                seen_count, min_rssi, max_rssi, avg_rssi)
                            VALUES (?,?,?,?,?,1,?,?,?)
                            ON CONFLICT(bssid) DO UPDATE SET
-                             ssid=COALESCE(excluded.ssid, places.ssid),
-                             channel=COALESCE(excluded.channel, places.channel),
-                             first_seen=MIN(places.first_seen, excluded.first_seen),
-                             last_seen=MAX(places.last_seen, excluded.last_seen),
-                             seen_count=places.seen_count+1,
-                             min_rssi=CASE WHEN excluded.min_rssi IS NULL THEN places.min_rssi
-                                           ELSE MIN(places.min_rssi, excluded.min_rssi) END,
-                             max_rssi=CASE WHEN excluded.max_rssi IS NULL THEN places.max_rssi
-                                           ELSE MAX(places.max_rssi, excluded.max_rssi) END,
-                             avg_rssi=CASE WHEN excluded.avg_rssi IS NULL THEN places.avg_rssi
-                                           ELSE (places.avg_rssi*places.seen_count + excluded.avg_rssi)
-                                                / (places.seen_count+1) END""",
+                            ssid=COALESCE(excluded.ssid, places.ssid),
+                            channel=COALESCE(excluded.channel, places.channel),
+                            first_seen=MIN(places.first_seen, excluded.first_seen),
+                            last_seen=MAX(places.last_seen, excluded.last_seen),
+                            seen_count=places.seen_count+1,
+                            min_rssi=CASE WHEN excluded.min_rssi IS NULL THEN places.min_rssi
+                                          ELSE MIN(places.min_rssi, excluded.min_rssi) END,
+                            max_rssi=CASE WHEN excluded.max_rssi IS NULL THEN places.max_rssi
+                                          ELSE MAX(places.max_rssi, excluded.max_rssi) END,
+                            avg_rssi=CASE WHEN excluded.avg_rssi IS NULL THEN places.avg_rssi
+                                          ELSE (places.avg_rssi*places.seen_count + excluded.avg_rssi)
+                                               / (places.seen_count+1) END""",
                         (bssid, fr.get("ssid"), fr.get("channel"),
                          now, now, rssi, rssi, rssi),
                     )
+                    # Keep the raw sample too — the brain's PLACE gate reads a
+                    # recent-window robust spread from beacon_samples (all-time
+                    # min/max is outlier-poisoned and would reject stable places).
+                    if rssi is not None:
+                        cur.execute(
+                            "INSERT INTO beacon_samples (bssid, received_at, rssi) VALUES (?,?,?)",
+                            (bssid, now, rssi),
+                        )
                 elif kind == "probe_req":
                     cur.execute(
                         """INSERT INTO probes (received_at, node_id, client_mac, ssid, channel, rssi)

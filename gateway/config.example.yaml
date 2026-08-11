@@ -70,6 +70,12 @@ world_model:
   # WiFi places registry (type:"wifi" beacon frames → BSSID table):
   # a BSSID becomes a PLACE entity when it has enough sightings, a stable
   # RSSI profile (it "never moves"), and a meaningful observation span.
+  # Stability uses a RECENT-window robust p10-p90 spread from beacon_samples
+  # (all-time min/max is outlier-poisoned — the home AP dips -31 once and
+  # would read "8dB unstable" forever). 8dB admits the apartment's own
+  # router (measured p10-p90 7dB) while still excluding noisy/moving BSSIDs.
   place_min_seen: 3
-  place_max_rssi_variance: 6
+  place_max_rssi_variance: 8
   place_min_span_seconds: 86400   # 24h, default
+  place_variance_window_seconds: 86400   # recent window for stability (24h)
+  place_variance_min_samples: 5   # min samples in window before trusting it

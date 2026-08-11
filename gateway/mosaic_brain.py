@@ -20,6 +20,7 @@ Usage:
   python3 mosaic_brain.py --chains          # class-weighted entity chains
   python3 mosaic_brain.py --places          # BSSID registry → PLACE entities
   python3 mosaic_brain.py --probes          # probe-request identity log
+  python3 mosaic_brain.py --backfill-beacons  # rebuild beacon_samples from events
   python3 mosaic_brain.py --where "home"    # resolve a place label via BSSIDs
 """
 
@@ -29,7 +30,7 @@ import math
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB = os.path.expanduser("~/.orb/orb.db")
 LABELS_FILE = os.path.expanduser("~/.orb/owner_devices.json")
@@ -62,8 +63,15 @@ DEFAULT_WM = {
     "class_match_multiplier": 1.5,      # same recognized class at same level
     "class_mismatch_penalty": 0.3,      # different classes at same level
     "place_min_seen": 3,                # beacon sightings before a BSSID is a place
-    "place_max_rssi_variance": 6,       # dB: stable-RSSI gate for PLACE
+    "place_max_rssi_variance": 8,       # dB: robust p10-p90 spread gate for PLACE
+    # Data (Aug 11, 4h of real beacons): the home AP — the strongest, most
+    # important BSSID — swings 8dB all-time / 7dB p10-p90 / std 2.5 from rare
+    # dips. 6dB would permanently reject it as a PLACE once the 24h span gate
+    # opens (all-time min/max only grows). 8dB admits it while still excluding
+    # genuinely noisy/moving BSSIDs.
     "place_min_span_seconds": 86400,    # min first→last span for PLACE (24h)
+    "place_variance_window_seconds": 86400,  # recent window for stability (24h)
+    "place_variance_min_samples": 5,    # min samples in window before trusting it
 }
 
 
@@ -133,6 +141,18 @@ def ensure_schema(c):
         rssi        INTEGER
     )
     """)
+    # Per-beacon RSSI samples (written by the gateway from type:"wifi" beacons).
+    # PLACE stability is computed from a RECENT window of these samples, not
+    # the places table's monotonic all-time min/max (outlier-poisoned).
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS beacon_samples (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        bssid       TEXT,
+        received_at TEXT,
+        rssi        INTEGER
+    )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_beacon_samples_bssid ON beacon_samples(bssid, received_at)")
 
 
 def load_labels():
@@ -458,6 +478,13 @@ def places_view(c):
     A BSSID that never moves (stable RSSI profile) + enough beacon sightings
     + a meaningful observation span = a PLACE. Labels resolve from
     locations.json when present (e.g. A8:F5:DD:CA:AC:3C → "home").
+
+    Stability is measured from beacon_samples over a RECENT window (robust
+    p10-p90 spread), NOT the places table's all-time min/max — a single
+    outlier dip would otherwise permanently disqualify a stable place
+    (all-time min/max only grows; the home AP dips -31 once and is "8dB
+    unstable" forever). Falls back to all-time min/max when a BSSID has no
+    samples yet (pre-beacon_samples collection).
     """
     ensure_schema(c)
     wm = WM
@@ -465,9 +492,48 @@ def places_view(c):
         "SELECT * FROM places ORDER BY seen_count DESC")]
     locations = load_locations()
 
+    # Recent-window sample spread per BSSID: (spread, n_samples, span_s).
+    # SQLite window: normalize ISO 'T' → ' ' like everywhere else.
+    w_start = (datetime.now(timezone.utc) -
+               timedelta(seconds=wm["place_variance_window_seconds"])).isoformat(timespec="seconds")
+    w_start_norm = w_start.replace("T", " ")
+    sample_stats = {}
+    for r in c.execute(
+            """SELECT bssid,
+                      COUNT(*) AS n,
+                      MIN(rssi) AS mn, MAX(rssi) AS mx,
+                      MIN(received_at) AS first_t, MAX(received_at) AS last_t
+               FROM beacon_samples
+               WHERE REPLACE(substr(received_at,1,19),'T',' ') > ?
+               GROUP BY bssid""", (w_start_norm,)):
+        # p10-p90 robust spread needs the sorted list — compute per-BSSID below
+        sample_stats[r["bssid"]] = {
+            "n": r["n"], "mn": r["mn"], "mx": r["mx"],
+            "first_t": r["first_t"], "last_t": r["last_t"],
+        }
+    # Robust spread: p10-p90 of the recent samples (percentile, not max-min).
+    robust = {}
+    for bssid, st in sample_stats.items():
+        vals = [r[0] for r in c.execute(
+            """SELECT rssi FROM beacon_samples WHERE bssid=?
+               AND REPLACE(substr(received_at,1,19),'T',' ') > ?
+               ORDER BY rssi""", (bssid, w_start_norm))]
+        if len(vals) >= wm["place_variance_min_samples"]:
+            n = len(vals)
+            lo = vals[max(0, int(n * 0.10) - 1)]
+            hi = vals[min(n - 1, int(n * 0.90) - 1)]
+            robust[bssid] = hi - lo
+
     places = []
     for r in rows:
-        variance = (r["max_rssi"] or 0) - (r["min_rssi"] or 0)
+        # Recent-window robust spread when we have samples; else all-time min/max.
+        st = sample_stats.get(r["bssid"])
+        if st and r["bssid"] in robust:
+            variance = robust[r["bssid"]]
+            variance_note = f"p10p90/{st['n']}"
+        else:
+            variance = (r["max_rssi"] or 0) - (r["min_rssi"] or 0)
+            variance_note = f"minmax/{r['seen_count']}"
         span_s = 0
         try:
             t0 = datetime.fromisoformat(r["first_seen"].replace("Z", "+00:00"))
@@ -485,7 +551,7 @@ def places_view(c):
             "bssid": r["bssid"], "ssid": r["ssid"] or "?", "channel": r["channel"],
             "first_seen": r["first_seen"], "last_seen": r["last_seen"],
             "seen": r["seen_count"], "min": r["min_rssi"], "max": r["max_rssi"],
-            "avg": r["avg_rssi"], "variance": variance,
+            "avg": r["avg_rssi"], "variance": variance, "var_note": variance_note,
             "span_h": round(span_s / 3600, 1),
             "place": is_place, "label": label,
         })
@@ -498,16 +564,17 @@ def print_places(places):
         print("No BSSIDs in the places registry yet — wait for type:\"wifi\" "
               "beacon envelopes (firmware sends a batch every 5 min).")
         return
-    print(f"{'PLACE':<6} {'SSID':<20} {'BSSID':<20} {'ch':>3} {'seen':>5} {'rssi':>10} {'var':>4} {'span_h':>6}  label")
-    print("-" * 92)
+    print(f"{'PLACE':<6} {'SSID':<20} {'BSSID':<20} {'ch':>3} {'seen':>5} {'rssi':>10} {'var':>5} {'span_h':>6}  label")
+    print("-" * 95)
     for p in places:
         mark = "PLACE" if p["place"] else "    "
         rng = f"{p['min']}..{p['max']}" if p["min"] is not None else "?"
         print(f"{mark:<6} {(p['ssid'] or '?')[:19]:<20} {p['bssid']:<20} {p['channel'] or '?':>3} "
-              f"{p['seen']:>5} {rng:>10} {p['variance']:>4} {p['span_h']:>6}  {p['label'] or ''}")
+              f"{p['seen']:>5} {rng:>10} {p['variance']:>4}{p['var_note']:>6} {p['span_h']:>6}  {p['label'] or ''}")
     n_places = sum(1 for p in places if p["place"])
     print(f"\n{len(places)} BSSIDs in registry, {n_places} resolve to PLACE "
-          f"(seen>={WM['place_min_seen']}, var<={WM['place_max_rssi_variance']}dB, "
+          f"(seen>={WM['place_min_seen']}, var<={WM['place_max_rssi_variance']}dB "
+          f"recent-{WM['place_variance_window_seconds']}s robust, "
           f"span>={WM['place_min_span_seconds']}s).")
 
 
@@ -540,6 +607,37 @@ def probes_view(c, limit=20):
     return rows
 
 
+def backfill_beacons(c):
+    """Rebuild beacon_samples from the events JSONL history.
+
+    The events table stores the full payload JSON of every envelope, including
+    type:"wifi" beacon frames. This reconstructs the per-beacon sample log for
+    deployments that collected wifi beacons before beacon_samples existed
+    (idempotent: wipes and re-inserts from events).
+    """
+    ensure_schema(c)
+    c.execute("DELETE FROM beacon_samples")
+    rows = c.execute("SELECT received_at, payload FROM events WHERE type='wifi'").fetchall()
+    n = 0
+    for received_at, payload in rows:
+        try:
+            frames = json.loads(payload).get("frames", [])
+        except Exception:
+            continue
+        for fr in frames:
+            if not isinstance(fr, dict) or fr.get("kind") != "beacon":
+                continue
+            bssid = (fr.get("bssid") or fr.get("mac") or "").lower()
+            rssi = fr.get("rssi")
+            if bssid and rssi is not None:
+                c.execute(
+                    "INSERT INTO beacon_samples (bssid, received_at, rssi) VALUES (?,?,?)",
+                    (bssid, received_at, rssi))
+                n += 1
+    c.commit()
+    print(f"backfilled {n} beacon samples from {len(rows)} wifi envelopes.")
+
+
 def where_view(c, label):
     """mosaic_where: resolve a place label → BSSIDs → current signal picture."""
     ensure_schema(c)
@@ -570,6 +668,8 @@ def main():
     ap.add_argument("--chains", action="store_true", help="collapse handoffs into entity chains")
     ap.add_argument("--places", action="store_true", help="BSSID registry → PLACE entities")
     ap.add_argument("--probes", action="store_true", help="probe-request identity log")
+    ap.add_argument("--backfill-beacons", action="store_true",
+                    help="rebuild beacon_samples from events JSON history")
     ap.add_argument("--where", metavar="LABEL", help="resolve a place label via BSSIDs")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
@@ -592,10 +692,13 @@ def main():
         print_places(places_view(c))
     if args.probes:
         probes_view(c)
+    if args.backfill_beacons:
+        backfill_beacons(c)
     if args.where:
         where_view(c, args.where)
     if not (args.status or args.devices or args.seed_labels or args.bind_slots
-            or args.handoffs or args.chains or args.places or args.probes or args.where):
+            or args.handoffs or args.chains or args.places or args.probes
+            or args.backfill_beacons or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 
