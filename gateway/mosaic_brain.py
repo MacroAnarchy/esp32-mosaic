@@ -418,8 +418,10 @@ def print_entity_view(rows, limit=40):
 # ENTITY SLOT (full-history chain) to the slot's most recent member = the
 # object's current identity; presence = slot activity. When the seed slot is
 # stale but an active STRONG device sits at the seed's signal level, surface
-# it as an OWNER-SHAPED CANDIDATE: visible but NOT bound — labels are earned,
-# and the WiFi-join correlation (the documented rebind path) is confirmation.
+# it as an OWNER-SHAPED CANDIDATE and headline the seed PROBABLE: visible but
+# NOT bound — labels are earned, and the WiFi-join correlation (the documented
+# rebind path) is confirmation. STALE only when no fresh owner-shaped
+# candidate exists.
 
 def owner_view(c, hours=24, report=True):
     """M1 resolver: owner presence through entity chains."""
@@ -488,9 +490,6 @@ def owner_view(c, hours=24, report=True):
                              f"@ {row['active_avg']:.1f} dB (slot {row['slot_n']} MACs, "
                              f"level {row['anchor_avg']})")
         else:
-            row["state"] = "STALE"
-            row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac'][:8]}…, "
-                             f"level {row['anchor_avg']})")
             # owner-shaped candidate: active STRONG device at the seed level,
             # not part of the seed's own slot. Reported, never auto-bound.
             cands = []
@@ -507,12 +506,25 @@ def owner_view(c, hours=24, report=True):
                 cands.append(m)
             cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
             if cands:
+                # Fresh (≤ present_s) + strong (STRONG tier at seed level) =
+                # the owner-shaped signature is LIVE right now. Headline says
+                # PROBABLE, not STALE: "not home" is a wrong answer when an
+                # owner-shaped device is active at seed level this second.
                 m = cands[0]
                 cd = (now - _parse_ts(m["last_ts"])).total_seconds()
                 row["candidate"] = (f"{m['mac']} @ {m['avg_rssi']:.1f} dB "
                                     f"(Δ{abs(m['avg_rssi']-anchor_avg):.1f}) "
                                     f"co={m['company_id'] or '-'} last {int(cd)}s ago "
                                     f"— owner-shaped, unbound")
+                row["state"] = "PROBABLE"
+                row["detail"] = (f"slot ended {age/3600:.1f}h ago, but an owner-shaped "
+                                 f"device is ACTIVE now ({int(cd)}s ago @ {m['avg_rssi']:.1f} "
+                                 f"dB, slot level {row['anchor_avg']}) — awaiting "
+                                 f"WiFi-join confirmation")
+            else:
+                row["state"] = "STALE"
+                row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac'][:8]}…, "
+                                 f"level {row['anchor_avg']})")
         out.append(row)
     if report:
         print_owner_view(out)
@@ -526,8 +538,9 @@ def print_owner_view(out):
         print(f"  {r['label']:<24} {r['state']:<10} {r['detail']}")
         if r.get("candidate"):
             print(f"{'':<24} {'':<10} └ candidate: {r['candidate']}")
-    print("  PRESENT = slot active ≤ 10min · candidate = unlabeled STRONG device at "
-          "seed level (unbound until WiFi-join confirmation)")
+    print("  PRESENT = slot active ≤ 10min · PROBABLE = slot stale but a strong "
+          "owner-shaped device is ACTIVE at seed level now (unbound until "
+          "WiFi-join confirmation) · STALE = no owner-shaped evidence in window")
 
 
 def channel_health(c, report=True):
