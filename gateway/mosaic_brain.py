@@ -58,7 +58,6 @@ MUTED_SPREAD = 20            # dB: above this = location evidence muted
 SPREAD_MIN_SAMPLES = 10      # below this, p10-p90 is unreliable → fall back to raw
 CO_OCCUR_BIND_SECONDS = 120  # new MAC seen within this of an anchor = slot candidate
 CO_OCCUR_LEVEL_GATE = 8      # dB: same-entity rotation keeps signal level (data: -62 cluster ±3)
-
 # Class coherence (BLE): the SAME device_class at the SAME RSSI level is much
 # stronger evidence of one rotating entity; DIFFERENT classes at one level are
 # different devices (a phone and an AirTag at -62 dB are NOT the same entity).
@@ -79,6 +78,15 @@ DEFAULT_WM = {
     "place_min_span_seconds": 86400,    # min first→last span for PLACE (24h)
     "place_variance_window_seconds": 86400,  # recent window for stability (24h)
     "place_variance_min_samples": 5,    # min samples in window before trusting it
+    # Stream bind (Aug 11): entity chains sever because real rotation cadence
+    # (~14 min for the desk iPhone's dual BLE identities) >> tau=90s decay gate.
+    # The greedy temporal walk reconnects fragments: ended MAC A → new MAC B at
+    # the same level/company within stream_max_gap. Observed handoff gaps: 20-23s;
+    # the 14-min period is the ceiling for a missed scan. Level gate: the two
+    # -43dB streams sit at ±1.5dB of each other; 4dB keeps streams/entities apart
+    # while tolerating RSSI drift.
+    "stream_max_gap_seconds": 600,      # max B.first - A.last for a stream edge
+    "stream_level_gate": 4,             # dB: |avgA - avgB| for a stream edge
 }
 
 
@@ -334,22 +342,93 @@ def print_entity_view(rows, limit=40):
     print(f"  {summary}  (of {len(rows)} devices; spr = robust p10-p90 spread, raw = max-min)")
 
 
-def collapse_chains(rows, min_weight=0.7):
+def collapse_chains(rows, macs=None, min_weight=0.7):
     """Turn pairwise rotation binds into transitive chains.
 
     A→B, B→C, C→D (each a rotation bind above min_weight) = ONE chain = ONE
     entity slot. Union-find over the bind graph. Returns list of chains,
     each = ordered list of MACs (by first appearance).
+
+    TWO edge sources (Aug 11, stream bind):
+    1. PAIRWISE rotation binds — tight time-decay gate (weight ≥ min_weight,
+       STRONG both sides, level-coherent). Catches handoffs the scanner sees
+       within ~30s AND class-multiplied AirTag rotations. Excludes pairs with
+       both companies known-but-DIFFERENT (a phone advertising TWO parallel
+       BLE streams — two manufacturer companies — rotating in lockstep: the
+       gap-0 cross-stream pair used to merge them into one chain).
+    2. STREAM CONTINUATION — greedy temporal walk over per-MAC aggregates.
+       Real rotation cadence (~14 min for the desk phone) is far beyond the
+       tau=90s decay gate, and single-sample RSSI at the handoff is too noisy
+       for the 6dB continuity check — so chains fragment. The walk reconnects:
+       for each MAC B (first-seen order), bind the best ENDED predecessor A
+       (gap ≤ stream_max_gap, STRONG both, |avgΔ| ≤ stream_level_gate, same
+       company preferred, class-coherent) that no other MAC already claimed
+       (one successor per MAC = no fan-out, no chain merging).
     """
-    # Only rotation binds (continuity) with sufficient time-decay weight,
-    # STRONG-tier pairs only (same policy as the handoff report: weak/faint
-    # devices do not resolve into entity slots), AND level coherence:
-    # same-entity rotation keeps signal level (a phone rotating MACs stays
-    # ~-62; bridging to a -90 neighbor is over-merge).
+    wm = WM
+    # 1) pairwise rotation edges — plus company coherence: two KNOWN but
+    #    different companies are different identities, never one slot.
     edges = [(r["from"], r["to"], r["weight"]) for r in rows
              if r["kind"] == "ROTATION?" and r["weight"] >= min_weight
              and r["from_tier"] == "STRONG" and r["to_tier"] == "STRONG"
-             and abs(r["from_avg"] - r["to_avg"]) <= CO_OCCUR_LEVEL_GATE]
+             and abs(r["from_avg"] - r["to_avg"]) <= CO_OCCUR_LEVEL_GATE
+             and not (r.get("from_company") and r.get("to_company")
+                      and r["from_company"] != r["to_company"])]
+
+    # 2) stream continuation edges
+    if macs:
+        from datetime import datetime
+        max_gap = wm.get("stream_max_gap_seconds", 600)
+        level_gate = wm.get("stream_level_gate", 4)
+        claimed = {a for a, _b, _w in edges}  # MACs already bound as predecessor
+        ordered = sorted(macs.values(), key=lambda m: m["first_ts"])
+        for B in ordered:
+            try:
+                t_b = datetime.fromisoformat(B["first_ts"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+            best, best_key = None, None
+            for A in ordered:
+                if A["mac"] == B["mac"] or A["mac"] in claimed:
+                    continue
+                # ordered by first_ts: any candidate needs A.first < B.first
+                # (A must end before B starts, so it starts earlier too)
+                if A["first_ts"] >= B["first_ts"]:
+                    break
+                # temporal order: A must have ENDED before B started. Same
+                # second = same scan batch (the node timestamps a whole scan
+                # batch with one received_at) — still sequential, allow it;
+                # the company filter below is what keeps parallel identities
+                # apart.
+                try:
+                    t_a = datetime.fromisoformat(A["last_ts"].replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if t_a > t_b:
+                    continue
+                gap = (t_b - t_a).total_seconds()
+                if gap > max_gap:
+                    continue
+                if tier_of(A["avg_rssi"]) != "STRONG" or tier_of(B["avg_rssi"]) != "STRONG":
+                    continue
+                if abs(A["avg_rssi"] - B["avg_rssi"]) > level_gate:
+                    continue
+                # company: different KNOWN companies = different identities
+                ca, cb = A.get("company_id"), B.get("company_id")
+                if ca and cb and ca != cb:
+                    continue
+                # class coherence (Layer 4): recognized-class vs unknown is a
+                # mismatch — an AirTag slot must not swallow an unknown device
+                ca_cls, cb_cls = A.get("device_class"), B.get("device_class")
+                if ((ca_cls in RECOGNIZED_CLASSES) != (cb_cls in RECOGNIZED_CLASSES)):
+                    continue
+                # rank: same known company first, then tightest gap
+                key = (0 if (ca and cb and ca == cb) else 1, gap)
+                if best_key is None or key < best_key:
+                    best, best_key = A["mac"], key
+            if best is not None:
+                edges.append((best, B["mac"], 1.0))
+                claimed.add(best)
 
     parent = {}
     def find(x):
@@ -373,18 +452,21 @@ def collapse_chains(rows, min_weight=0.7):
         chains.setdefault(root, set()).add(a)
         chains.setdefault(root, set()).add(b)
 
+    first_seen = {m["mac"]: m["first_ts"] for m in macs.values()} if macs else {}
     ordered = []
-    for root, macs in chains.items():
-        if len(macs) < 2:
+    for root, macs_set in chains.items():
+        if len(macs_set) < 2:
             continue
-        # order by first appearance in the sighting stream (approx: sort MACs)
-        ordered.append(sorted(macs))
+        if first_seen:
+            ordered.append(sorted(macs_set, key=lambda m: first_seen.get(m, "")))
+        else:
+            ordered.append(sorted(macs_set))
     return ordered
 
 
 def print_chains(c, hours=24):
-    rows = analyze_handoffs(c, hours, report=False)
-    chains = collapse_chains(rows)
+    rows, macs = analyze_handoffs(c, hours, report=False, return_macs=True)
+    chains = collapse_chains(rows, macs)
     print(f"\nENTITY CHAINS ({len(chains)} from {len(rows)} handoff pairs):")
     print("-" * 70)
     for chain in sorted(chains, key=len, reverse=True):
@@ -399,7 +481,16 @@ def print_chains(c, hours=24):
     return chains
 
 
-def analyze_handoffs(c, hours=24, report=True):
+def tier_of(avg):
+    """LAYER 1: signal quality floor. STRONG resolves, EDGE counts only."""
+    if avg >= -70:
+        return "STRONG"
+    if avg >= -85:
+        return "MID"
+    return "EDGE"
+
+
+def analyze_handoffs(c, hours=24, report=True, return_macs=False):
     """Three-layer handoff analysis (data association in RSSI space).
 
     LAYER 1 — TIER: signal quality floor. STRONG resolves, EDGE counts only.
@@ -429,7 +520,7 @@ def analyze_handoffs(c, hours=24, report=True):
     for mac, minute in cur.fetchall():
         presence.setdefault(mac, set()).add(minute)
 
-    # First/last RSSI + timestamps per MAC in window (+ latest device_class)
+    # First/last RSSI + timestamps per MAC in window (+ latest device_class/company)
     cur = c.execute("""
     SELECT s1.mac,
            (SELECT rssi FROM sightings s2 WHERE s2.mac = s1.mac
@@ -443,11 +534,15 @@ def analyze_handoffs(c, hours=24, report=True):
            (SELECT device_class FROM sightings s4
             WHERE s4.mac = s1.mac AND s4.device_class IS NOT NULL
             AND REPLACE(substr(s4.received_at,1,19),'T',' ') > datetime('now', ?)
-            ORDER BY s4.received_at DESC LIMIT 1) AS device_class
+            ORDER BY s4.received_at DESC LIMIT 1) AS device_class,
+           (SELECT company_id FROM sightings s5
+            WHERE s5.mac = s1.mac AND s5.company_id IS NOT NULL
+            AND REPLACE(substr(s5.received_at,1,19),'T',' ') > datetime('now', ?)
+            ORDER BY s5.received_at DESC LIMIT 1) AS company_id
     FROM sightings s1
     WHERE REPLACE(substr(s1.received_at,1,19),'T',' ') > datetime('now', ?)
     GROUP BY s1.mac
-    """, (window_start, window_start, window_start, window_start))
+    """, (window_start, window_start, window_start, window_start, window_start))
     macs = {r[0]: dict(r) for r in cur.fetchall()}
 
     # LAYER 1: tier by average RSSI
@@ -511,6 +606,8 @@ def analyze_handoffs(c, hours=24, report=True):
                 "from_avg": A["avg_rssi"], "to_avg": B["avg_rssi"],
                 "from_class": A.get("device_class") or "-",
                 "to_class": B.get("device_class") or "-",
+                "from_company": A.get("company_id"),
+                "to_company": B.get("company_id"),
                 "class_match": cmatch,
                 "delta": delta, "gap_s": int(gap_s), "weight": weight,
                 "kind": kind,
@@ -533,6 +630,8 @@ def analyze_handoffs(c, hours=24, report=True):
                 break
         if shown == 0:
             print("  (no STRONG-tier handoffs in window)")
+    if return_macs:
+        return rows, macs
     return rows
 
 

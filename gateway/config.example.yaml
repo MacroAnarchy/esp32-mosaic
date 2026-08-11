@@ -79,3 +79,12 @@ world_model:
   place_min_span_seconds: 86400   # 24h, default
   place_variance_window_seconds: 86400   # recent window for stability (24h)
   place_variance_min_samples: 5   # min samples in window before trusting it
+
+  # Stream bind (entity chains): real BLE MAC rotation cadence (~14 min for a
+  # phone's dual identities) is far beyond the tau=90s time-decay gate, so
+  # chains fragment. The greedy temporal walk reconnects: an ENDED MAC A
+  # followed by a new MAC B at the same RSSI level and (preferably) same
+  # manufacturer company = one rotating identity. Observed handoff gaps in
+  # live data: 20-23s; the rotation period is the ceiling for missed scans.
+  stream_max_gap_seconds: 600   # max B.first - A.last for a stream edge
+  stream_level_gate: 4          # dB: |avgA - avgB| for a stream edge
