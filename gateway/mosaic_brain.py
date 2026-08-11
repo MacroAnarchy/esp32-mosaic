@@ -103,6 +103,17 @@ DEFAULT_WM = {
     "lockstep_gap_align_minutes": 5,    # shared gaps must START within this
     "lockstep_gap_min_shared_minutes": 15,  # shared overlap must be this long
     "lockstep_gap_shared_min": 0.5,     # min shared fraction of the shorter list
+    # Resurrection (Aug 11): before the firmware attributed company_id
+    # (~20:30 UTC 10-Aug) the desk phone's chains carried company '-' —
+    # primary grouping (same company+class) can't join them to today's
+    # 76/301 streams, hiding a departure that spans the attribution change
+    # (measured: both identities silent 17:23:26→20:30:09 while the -94
+    # noise floor kept streaming). A known-company stream inherits the
+    # preceding same-level '-' stream as an ANCESTOR SLOT when the gap is
+    # within this cap; the MAC set merges so the absence is computed from
+    # real presence. 6h covers evening-out departures; a full workday away
+    # stays unbridged until data shows it is safe.
+    "lockstep_resurrect_max_gap_seconds": 21600,
 }
 
 
@@ -624,7 +635,11 @@ def lockstep_pairs(c, hours=24, report=True):
 
     Chains are first grouped into identity streams (same company+class+level,
     sequential spans) so that departures longer than the stream-bind gap
-    don't hide the absence. Confirmed pairs are ONE object with two slots.
+    don't hide the absence. Legacy streams from before company attribution
+    (company '-') are RESURRECTED as ancestor slots of the same-level
+    known-company stream that follows them — the 17:23→20:30 joint departure
+    on 10-Aug spanned the attribution change and was otherwise invisible.
+    Confirmed pairs are ONE object with two slots.
     Chains/streams are never merged: identities stay separate slots.
     """
     wm = WM
@@ -659,6 +674,47 @@ def lockstep_pairs(c, hours=24, report=True):
         m["gaps"] = _chain_gaps(mac_minutes, m["chain"], gap_min)
 
     streams = _group_streams(metas, level_gate)
+
+    # --- CROSS-COMPANY RESURRECTION ---------------------------------------
+    # The node did not attribute company_id before the firmware fix
+    # (~20:30 UTC 10-Aug), so that era's chains all carry company '-' and
+    # primary grouping (same company+class) cannot join them to today's
+    # 76/301 streams — a departure spanning the change is invisible to
+    # shared-absence detection. Resurrection: a known-company stream may
+    # inherit the preceding same-level legacy stream as an ANCESTOR SLOT
+    # (sequential spans, gap within lockstep_resurrect_max_gap_seconds).
+    # The MAC set merges, so the absence is computed from REAL presence
+    # minutes (node-alive filtering below still applies). Multiple streams
+    # may inherit the same ancestor: the legacy chain conflated both
+    # parallel radios of one device, so a fork (both successors sharing
+    # the ancestor's absence history) is the honest model.
+    resurrect_max = wm.get("lockstep_resurrect_max_gap_seconds", 21600)
+    inheritors = {}
+    if resurrect_max > 0:
+        def _p(iso):
+            return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        legacy = [s for s in streams if s.get("company") is None]
+        for s in streams:
+            if s.get("company") is None:
+                continue
+            best = None
+            for a in legacy:
+                if abs(s["avg"] - a["avg"]) > level_gate:
+                    continue
+                if _p(a["last"]) > _p(s["first"]):
+                    continue  # overlapping spans = parallel, not sequential
+                if (_p(s["first"]) - _p(a["last"])).total_seconds() > resurrect_max:
+                    continue
+                if best is None or _p(a["last"]) > _p(best["last"]):
+                    best = a
+            if best is not None:
+                best["consumed"] = True
+                s["ancestor"] = best
+                s["first"] = best["first"]
+                s["n"] += best["n"]
+                s["macs"] = best["macs"] + s["macs"]
+                inheritors.setdefault(id(best), []).append(s)
+
     for s in streams:
         gaps = _chain_gaps(mac_minutes, s["macs"], gap_min)
         # tag node-level gaps: mostly silent WORLDWIDE (gateway/node outage
@@ -683,8 +739,17 @@ def lockstep_pairs(c, hours=24, report=True):
         for i, s in enumerate(streams):
             cad = f"{s['cadence_s']/60:.1f}min" if s["cadence_s"] else "-"
             glob = f" (+{s['global_gaps']} node)" if s.get("global_gaps") else ""
+            anc = " *" if s.get("ancestor") else ""
+            cons = ""
+            if s.get("consumed"):
+                kids = ",".join(f"#{streams.index(x)}" for x in inheritors.get(id(s), []))
+                cons = f"  †→{kids}"
             print(f"{i:>2} {s['n']:>3} {str(s['company'] or '-'):>5} {str(s['cls'] or '-'):>8} "
-                  f"{s['avg']:>6.1f} {cad:>8} {len(s['gaps']):>9}{glob}  {fmt_ts(s['first'])}→{fmt_ts(s['last'])}")
+                  f"{s['avg']:>6.1f} {cad:>8} {len(s['gaps']):>9}{glob}  "
+                  f"{fmt_ts(s['first'])}→{fmt_ts(s['last'])}{anc}{cons}")
+        if any(s.get("ancestor") for s in streams):
+            print("  * = resurrected: legacy '-' era ancestor merged (company attribution changed "
+                  "~20:30 UTC 10-Aug); absence now spans the change. † = consumed legacy stream.")
 
     # alignment fraction (informational — beat drift makes it weak evidence)
     def align_frac(A, B):
@@ -697,6 +762,8 @@ def lockstep_pairs(c, hours=24, report=True):
     for i in range(len(streams)):
         for j in range(i + 1, len(streams)):
             A, B = streams[i], streams[j]
+            if A.get("consumed") or B.get("consumed"):
+                continue  # legacy slot already inherited by a live stream
             if abs(A["avg"] - B["avg"]) > level_gate:
                 continue
             if tier_of(A["avg"]) != tier_of(B["avg"]):
