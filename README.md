@@ -98,7 +98,7 @@ few hours. Mosaic binds rotating MACs into **entities**:
 ```
 ENTITY: "the owner's iPhone"   (stable, labeled once)
 ├── slot: WiFi MAC    aa:bb:cc:dd:ee:ff   (stable anchor)
-└── slot: BLE MAC    11:22:33:44:55:66     (rotating occupant)
+└── slot: BLE MAC     11:22:33:44:55:66   (rotating occupant)
                      → next MAC → next MAC → (slot holds history)
 ```
 
