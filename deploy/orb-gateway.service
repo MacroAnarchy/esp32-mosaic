@@ -1,0 +1,20 @@
+[Unit]
+Description=ESP32-Mosaic ORB gateway (remembering-radar brain, port 9000)
+Documentation=https://github.com/MacroAnarchy/esp32-mosaic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/esp32-mosaic/gateway
+ExecStart=/usr/bin/python3 orb_gateway.py --port 9000
+Restart=always
+RestartSec=5
+# Keep the canonical log where it has always lived (also visible in journalctl --user -u orb-gateway)
+StandardOutput=append:%h/.orb/gateway.log
+StandardError=inherit
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
