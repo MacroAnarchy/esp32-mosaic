@@ -10,20 +10,15 @@ coherent world model: who's here, what's nearby, what stays and what moves.
 Different boards working together form a **mosaic** — each one a tile, together
 a picture of your world.
 
-**The remembering radar:** your AI only listens to you — because it knows who
-you are by radio.
-
 ## Why
 
 Every ESP32 scanner shows you devices and forgets them. Mosaic **remembers**:
 it learns the radio fingerprint of places, clusters devices into entities,
 and derives meaning from patterns over time. The remembering radar.
 
-The world model is built for **presence-gated AI**: an assistant that only
-responds to the entity it knows is physically in the room. Not a face camera,
-not a microphone — radio identity. Your phone, watch and earbuds form an
-entity cluster; the system learns what "you" looks like in RF, and CSI can
-later confirm a human body is actually there. Spoof-resistant presence.
+The model is passive, local and private: no cameras, no microphones, no cloud.
+It listens to the radio that's already around you and builds understanding
+from it — then exposes that understanding to whatever you want to use it for.
 
 ## Use cases
 
@@ -36,7 +31,7 @@ later confirm a human body is actually there. Spoof-resistant presence.
   habitual paths (bedroom → kitchen → door every morning), know when a person
   returns by their device constellation. The remembering radar — it sees what
   other scanners forget.
-- **Smart-home automation** — "the owner is home" triggers scenes from RF presence,
+- **Smart-home automation** — "you're home" triggers scenes from RF presence,
   not phone GPS or app state. The room knows when you're actually in it.
 
 ## What's inside
