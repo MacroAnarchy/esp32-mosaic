@@ -145,6 +145,17 @@ DEFAULT_WM = {
     # scan gaps while staying crisp for a person walking out).
     "owner_label_prefix": "OWNER_",
     "owner_present_seconds": 600,
+    # Channel health (Aug 11): the --status heartbeat surface. Per-channel
+    # max age before a channel reads STALE (2x = OFFLINE). scan/wifi are
+    # periodic streams (the node scans every ~20s, wifi cycle every few min).
+    # probes are opportunistic (modern phones mostly passive-scan — sparse
+    # is NORMAL). csi is event-driven: a still room produces no events for
+    # hours, so only a 12h+ silence means the channel itself is gone (today
+    # no node sends type:'csi' — the body channel is dead, now VISIBLE).
+    "channel_scan_max_age_seconds": 600,
+    "channel_wifi_max_age_seconds": 900,
+    "channel_probes_max_age_seconds": 3600,
+    "channel_csi_max_age_seconds": 43200,
 }
 
 
@@ -517,6 +528,92 @@ def print_owner_view(out):
             print(f"{'':<24} {'':<10} └ candidate: {r['candidate']}")
     print("  PRESENT = slot active ≤ 10min · candidate = unlabeled STRONG device at "
           "seed level (unbound until WiFi-join confirmation)")
+
+
+def channel_health(c, report=True):
+    """System channel heartbeat — is each sensing channel alive?
+
+    Answers the user-agent HIGH issue: 'a dead sensor is visible instead
+    of silently absent'. Channels:
+      scan   — BLE sightings stream (node scans every ~20s)
+      wifi   — WiFi beacon snapshots (offline scan cycle)
+      probes — probe requests (opportunistic: sparse is NORMAL)
+      csi    — body/motion channel (event-driven: a still room produces
+               no events for hours — only a long silence (knob, 12h)
+               means the channel itself is gone, e.g. no node sends
+               type:'csi')
+    States: LIVE (age <= max) / STALE (<= 2*max) / OFFLINE (> 2*max).
+    Also lists known nodes with last contact, so the operator sees WHICH
+    sensor stopped talking.
+    """
+    now = datetime.now(timezone.utc)
+    channels = [
+        ("scan",   "sightings",      "received_at", "channel_scan_max_age_seconds",
+         "periodic stream — node should be reporting every ~20s"),
+        ("wifi",   "beacon_samples", "received_at", "channel_wifi_max_age_seconds",
+         "periodic stream — beacon snapshots every few minutes"),
+        ("probes", "probes",         "received_at", "channel_probes_max_age_seconds",
+         "opportunistic: sparse is normal (phones mostly passive-scan)"),
+        ("csi",    "csi_events",     "received_at", "channel_csi_max_age_seconds",
+         "event-driven: quiet rooms are normal; OFFLINE = no CSI-capable "
+         "node reporting"),
+    ]
+    out = []
+    for name, table, col, knob, caveat in channels:
+        max_age = WM.get(knob, 600)
+        try:
+            row = c.execute(f"SELECT MAX({col}) v FROM {table}").fetchone()
+            last = row["v"] if row else None
+        except Exception:
+            last = None
+        if not last:
+            out.append({"channel": name, "state": "EMPTY", "age_s": None,
+                        "detail": f"{table} has no rows — channel never written"})
+            continue
+        dt = _parse_ts(last)
+        if dt is None:
+            out.append({"channel": name, "state": "UNPARSEABLE", "age_s": None,
+                        "detail": f"last {table} ts '{last}' unparseable"})
+            continue
+        age = (now - dt).total_seconds()
+        if age <= max_age:
+            state = "LIVE"
+        elif age <= max_age * 2:
+            state = "STALE"
+        else:
+            state = "OFFLINE"
+        detail = f"last event {age/3600:.1f}h ago"
+        if state == "OFFLINE":
+            detail += f" ({caveat})"
+        out.append({"channel": name, "state": state, "age_s": age, "detail": detail})
+    # node heartbeats — who is still talking at all?
+    nodes = []
+    try:
+        for r in c.execute(
+                "SELECT node_id, MAX(last_seen) last_seen FROM nodes "
+                "GROUP BY node_id ORDER BY last_seen DESC"):
+            dt = _parse_ts(r["last_seen"])
+            age = (now - dt).total_seconds() if dt else None
+            nodes.append({"node": r["node_id"], "age_s": age})
+    except Exception:
+        nodes = []
+    if report:
+        print_channel_health(out, nodes)
+    return out, nodes
+
+
+def print_channel_health(chans, nodes):
+    print("\nCHANNELS — sensing pipeline heartbeat (LIVE ≤ threshold · STALE ≤ 2× · OFFLINE beyond):")
+    print("-" * 78)
+    for ch in chans:
+        age = f"{ch['age_s']/3600:6.1f}h" if ch["age_s"] is not None else "     n/a"
+        print(f"  {ch['channel']:<7} {ch['state']:<9} age {age}  {ch['detail']}")
+    for n in nodes:
+        age = f"{n['age_s']/3600:.1f}h" if n["age_s"] is not None else "n/a"
+        state = "LIVE" if n["age_s"] is not None and n["age_s"] <= 600 else \
+                ("STALE" if n["age_s"] is not None and n["age_s"] <= 7200 else "GONE")
+        print(f"  node {n['node']:<22} {state:<6} last contact {age}")
+    print("  OFFLINE = a sensor that stopped talking — visible instead of silent.")
 
 
 def collapse_chains(rows, macs=None, min_weight=0.7):
@@ -1335,6 +1432,8 @@ def main():
     ap.add_argument("--probes", action="store_true", help="probe-request identity log")
     ap.add_argument("--owner", action="store_true",
                     help="M1: owner presence — resolve seeded owner labels through entity chains")
+    ap.add_argument("--channels", action="store_true",
+                    help="sensing pipeline heartbeat — per-channel + per-node liveness")
     ap.add_argument("--backfill-beacons", action="store_true",
                     help="rebuild beacon_samples from events JSON history")
     ap.add_argument("--where", metavar="LABEL", help="resolve a place label via BSSIDs")
@@ -1350,10 +1449,13 @@ def main():
         for r in c.execute("SELECT mac, label, stable FROM devices ORDER BY stable DESC"):
             print(f"{'*' if r['stable'] else ' '} {r['mac']}  {r['label']}")
     if args.status:
-        owner_view(c, args.hours)          # M1 first: 'is the owner home?'
+        channel_health(c)              # pipeline health gate FIRST — readings
+        owner_view(c, args.hours)      # are only as good as the channels
         print_entity_view(entity_view(c, args.hours))
     if args.owner:
         owner_view(c, args.hours)
+    if args.channels:
+        channel_health(c)
     if args.bind_slots or args.handoffs:
         analyze_handoffs(c, args.hours)
     if args.chains:
@@ -1370,7 +1472,8 @@ def main():
         where_view(c, args.where)
     if not (args.status or args.devices or args.seed_labels or args.bind_slots
             or args.handoffs or args.chains or args.lockstep or args.places
-            or args.probes or args.owner or args.backfill_beacons or args.where):
+            or args.probes or args.owner or args.channels or args.backfill_beacons
+            or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 

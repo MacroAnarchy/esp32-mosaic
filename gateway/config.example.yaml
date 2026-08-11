@@ -118,3 +118,14 @@ world_model:
   # stale crisply when the person walks out with the device).
   owner_label_prefix: OWNER_        # set to your deployment's label namespace
   owner_present_seconds: 600        # 10 min, default
+
+  # Channel health (the --status / --channels heartbeat): per-channel max
+  # age before a channel reads STALE (2x = OFFLINE). scan/wifi are periodic
+  # streams; probes are opportunistic (modern phones mostly passive-scan —
+  # sparse is NORMAL); csi is event-driven, so a still room stays quiet for
+  # hours and only a 12h+ silence means the channel itself is gone. A dead
+  # sensor is reported explicitly instead of silently absent.
+  channel_scan_max_age_seconds: 600     # BLE scans every ~20s → 10 min dead
+  channel_wifi_max_age_seconds: 900     # beacon snapshots every few min
+  channel_probes_max_age_seconds: 3600  # probe requests (opportunistic)
+  channel_csi_max_age_seconds: 43200    # body/motion events (12h quiet OK)
