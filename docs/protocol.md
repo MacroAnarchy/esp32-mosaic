@@ -1,7 +1,7 @@
 # ORB Protocol v1
 
 **The wire protocol for environment-aware AI companions.**
-Status: DRAFT (Aug 9, 2026 — the authors)
+Status: DRAFT (Aug 9, 2026)
 License: open (intended to be shared when Orb goes open source)
 
 ## Design Principles
@@ -34,7 +34,7 @@ License: open (intended to be shared when Orb goes open source)
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `v` | int | yes | Protocol version. Always 1 for this spec. |
-| `node` | string | yes | Stable node identifier: `orb`, `node-01`, `swarm-03`. Lowercase, no spaces. |
+| `node` | string | yes | Stable node identifier: `node-01`, `sentinel-3`, `swarm-03`. Lowercase, no spaces. |
 | `type` | string | yes | Payload type (see below). |
 | `ts` | int64 | yes | Node clock, epoch milliseconds. Best effort only. |
 | `payload` | object | yes | Type-specific body (see below). |

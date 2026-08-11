@@ -3,7 +3,7 @@ Pre-build config guard for ESP32-Mosaic firmware.
 
 Refuses to compile/flash if include/config.h still contains the EXAMPLE
 placeholder values. Background (2026-08-10 incident): the BLE/WiFi port
-overwrote node-01's working config.h with the example copy, the new firmware
+overwrote the test node's working config.h with the example copy, the new firmware
 was flashed, and the node could not join "YOUR_WIFI_SSID" — a dead node,
 silent pipeline for ~20 min. A node that can't rejoin WiFi is dead; this
 guard makes that failure impossible to build.
@@ -104,7 +104,7 @@ def main():
         problems.append("MOSAIC_NODE_NAME is missing")
     elif node in BAD_NODE_NAMES or any(m in node for m in PLACEHOLDER_MARKERS):
         problems.append(f"MOSAIC_NODE_NAME is the example default ({node!r}) — "
-                        "give this node a unique name (e.g. node-01, orb, sentinel-1)")
+                        "give this node a unique name (e.g. node-01, sentinel-1)")
 
     if problems:
         print("check_config: BUILD BLOCKED — include/config.h has unconfigured values.")

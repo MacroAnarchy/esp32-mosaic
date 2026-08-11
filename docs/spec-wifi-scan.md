@@ -4,16 +4,16 @@
 firmware using Marauder's pattern: drop WiFi association, hop channels
 promiscuously, capture, reconnect, report. The "mosaic goes offline to see" cycle.
 
-**Source reference:** `/home/owner/workspace/ESP32Marauder/esp32_marauder/WiFiScan.cpp`
+**Source reference:** `~/workspace/ESP32Marauder/esp32_marauder/WiFiScan.cpp`
 - `beaconSnifferCallback` (~line 8024) — the packet parser
 - `setWiFiMode(WIFI_MODE_NULL, cb)` + `esp_wifi_set_promiscuous(true)` (~line 3297)
 - `changeChannel()` — channel hopping
 - Probe capture pattern from `wifiSnifferCallback` (~line 9245)
 
-**Target:** `/home/owner/workspace/esp32-mosaic/firmware/src/main.cpp`
+**Target:** `firmware/src/main.cpp`
 (after the BLE port lands — this builds on top of it)
 
-## The design (the design)
+## The design (the "mosaic goes offline to see" insight)
 
 The ESP32 has ONE radio. Connected to WiFi = blind to everything else.
 The mosaic goes OFFLINE to see, then comes back to report:
@@ -50,7 +50,7 @@ wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
   "kind":"beacon|probe_req",
   "mac":"aa:bb:cc:dd:ee:ff",     // src (AP for beacon, client for probe)
   "bssid":"...",                 // beacon: the AP
-  "ssid":"HomeWiFi",             // beacon: broadcast name / probe: requested
+  "ssid":"HomeWiFi",            // beacon: broadcast name / probe: requested
   "channel":6,
   "rssi":-58
 }}

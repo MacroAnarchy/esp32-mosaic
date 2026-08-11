@@ -18,7 +18,7 @@ Hermes config (~/.hermes/config.yaml):
   mcp_servers:
     mosaic:
       command: "python3"
-      args: ["/home/owner/workspace/esp32-mosaic/gateway/mosaic_mcp.py"]
+      args: ["/path/to/esp32-mosaic/gateway/mosaic_mcp.py"]
 """
 
 import argparse

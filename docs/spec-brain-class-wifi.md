@@ -40,7 +40,7 @@ maps BSSID → label." Now we get actual BSSIDs from beacons.
   - bssid → first seen, last seen, ssid, channel, rssi profile, seen count
   - A BSSID that never moves + stable RSSI = a PLACE (entity that never moves)
 - Probe requests (`kind:"probe_req"`) = clients seeking known SSIDs:
-  - Probe for "HomeWiFi" from an unknown MAC = a device that KNOWS our network
+  - Probe for "HomeWiFi" from an unknown MAC = a device that KNOWS the network
     (returning entity — e.g. phone with WiFi off was nearby, probed, left)
   - This is the "identity from the air" layer: probes reveal device relationships
     to networks even without connection.

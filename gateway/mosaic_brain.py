@@ -4,7 +4,7 @@ mosaic_brain.py — ESP32-Mosaic world-model brain (v0.2: device_class + wifi).
 
 Turns the raw sighting stream into ENTITIES:
   - Per-device RSSI stats (min/max/avg/spread) → stationary vs moving
-  - Device labels/notes (from devices table, seeded from owner_devices.json)
+  - Device labels/notes (from devices table, seeded from device labels JSON)
   - Entity slots: rotating BLE MACs bind to stable anchors via co-occurrence
   - Class coherence: same device_class at same RSSI level = same entity
     (FindMy/Meta accessories keep their class across MAC rotation)
@@ -16,7 +16,7 @@ Turns the raw sighting stream into ENTITIES:
 Usage:
   python3 mosaic_brain.py --status          # entity view of recent data
   python3 mosaic_brain.py --devices         # device table
-  python3 mosaic_brain.py --seed-labels     # import owner_devices.json labels
+  python3 mosaic_brain.py --seed-labels     # import device labels JSON
   python3 mosaic_brain.py --chains          # class-weighted entity chains
   python3 mosaic_brain.py --places          # BSSID registry → PLACE entities
   python3 mosaic_brain.py --probes          # probe-request identity log
@@ -33,7 +33,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 DB = os.path.expanduser("~/.orb/orb.db")
-LABELS_FILE = os.path.expanduser("~/.orb/owner_devices.json")
+LABELS_FILE = os.path.expanduser("~/.mosaic/device_labels.json")
 LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
 
 # Time-window filter normalization.
@@ -163,7 +163,7 @@ def ensure_schema(c):
 
 
 def load_labels():
-    """Seed labels from owner_devices.json (manual annotations)."""
+    """Seed labels from device labels JSON (manual annotations)."""
     if not os.path.exists(LABELS_FILE):
         return {}
     with open(LABELS_FILE) as f:
@@ -704,7 +704,7 @@ def main():
     ap = argparse.ArgumentParser(description="ESP32-Mosaic world-model brain")
     ap.add_argument("--status", action="store_true", help="entity view of recent data")
     ap.add_argument("--devices", action="store_true", help="list device table")
-    ap.add_argument("--seed-labels", action="store_true", help="import owner_devices.json")
+    ap.add_argument("--seed-labels", action="store_true", help="import device labels JSON")
     ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
     ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
     ap.add_argument("--chains", action="store_true", help="collapse handoffs into entity chains")

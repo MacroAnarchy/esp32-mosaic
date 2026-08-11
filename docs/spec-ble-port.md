@@ -3,8 +3,8 @@
 **Goal:** Port the valuable BLE sniffing capabilities from ESP32Marauder into the
 ESP32-Mosaic firmware, WITHOUT the attack/spam modes. Passive + legal only.
 
-**Source reference:** `/home/owner/workspace/ESP32Marauder/esp32_marauder/WiFiScan.cpp` + `WiFiScan.h`
-**Target:** `/home/owner/workspace/esp32-mosaic/firmware/src/main.cpp` (current sense engine, ESP32 classic, PlatformIO)
+**Source reference:** `~/workspace/ESP32Marauder/esp32_marauder/WiFiScan.cpp` + `WiFiScan.h`
+**Target:** `firmware/src/main.cpp` (current sense engine, ESP32 classic, PlatformIO)
 
 ## Current state (main.cpp, 103 lines)
 - BLEDevice + BLEScan (Arduino BLE lib)
@@ -62,7 +62,7 @@ gateway/orb_gateway.py + mosaic_brain.py before relying on this).
   the new passive fields.
 - Keep the scan loop duty cycle sane (95% steady / 5% sweep is the design).
 - PlatformIO: add nimble-arduino dep. Current env `[env:esp32]` for ESP32 classic
-  (NODE-01). Do NOT break the build.
+  (test node). Do NOT break the build.
 - Do NOT touch gateway/orb_gateway.py — it's LIVE on port 9000 collecting data.
 - Do NOT touch mosaic_brain.py / mosaic_mcp.py — they're working (tuner active).
 

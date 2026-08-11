@@ -45,7 +45,7 @@ world_model:
   visit_absence_gap_seconds: 300
 
   # Composite binding: minimum co-occurrence consistency (0.0-1.0) before
-  # two leaf entities are treated as one composite (e.g. phone + watch = the owner).
+  # two leaf entities are treated as one composite (e.g. phone + watch = owner).
   composite_min_consistency: 0.8
 
   # Entity confidence: fraction of expected leaves seen in one window that

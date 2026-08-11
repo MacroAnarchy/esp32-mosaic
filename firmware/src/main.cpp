@@ -1,12 +1,12 @@
 /**
  * ESP32-Mosaic — BLE sense engine (NimBLE-Arduino, passive)
  *
- * Passive BLE presence detection for the Orb/NODE-01 swarm:
+ * Passive BLE presence detection for the Mosaic node swarm:
  *   1. BLE scan (controller-level dedup, DEVICE mode / 200-entry cache)
  *   2. AD payload parsing: manufacturer data (company_id), service UUIDs,
  *      service data UUID
  *   3. Device classification: "findmy" | "meta" | "flipper" | "unknown"
- *   4. HTTP POST → gateway /orb/ingest (ORB protocol v1 envelope)
+ *   4. HTTP POST → gateway /ingest (Mosaic protocol v1 envelope)
  *
  * Ported from ESP32Marauder's WiFiScan.cpp/h (bluetoothScanAllCallback,
  * FindMy detection, META/BLOCKED identifier tables) — passive parts only.
@@ -65,11 +65,11 @@
 #define WIFI_SCAN_MAX_CHANNEL 13                // 2.4GHz channels 1..13
 #define WIFI_SSID_MAX_LEN 33                    // 32 + NUL
 
-// WiFi credentials: legacy MOSAIC_* names, with MOSAIC_* fallback so a config.h
-// copied straight from config.example.h compiles too.
+// WiFi credentials: MOSAIC_* names from include/config.h
+// (fallback so a config.h copied from config.example.h compiles too)
 #ifndef MOSAIC_WIFI_SSID
-#define MOSAIC_WIFI_SSID MOSAIC_WIFI_SSID
-#define MOSAIC_WIFI_PASSWORD MOSAIC_WIFI_PASSWORD
+#define MOSAIC_WIFI_SSID "YOUR_WIFI_SSID"
+#define MOSAIC_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #endif
 
 // ---- Identity anchors (ported from ESP32Marauder WiFiScan.h/WiFiScan.cpp) ----
@@ -432,7 +432,7 @@ static void runWifiScanCycle() {
   // 5) Report the batch envelope (only if back online and frames captured)
   if (joined && g_wifiFrameCount > 0) {
     HTTPClient http;
-    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
+    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/ingest";
     String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) +
                      "\",\"type\":\"wifi\",\"ts\":" + String(millis()) +
                      ",\"payload\":{\"frames\":[";
@@ -456,14 +456,14 @@ static void runWifiScanCycle() {
   g_wifiFrameCount = 0;
 }
 
-// ORB protocol v1 — location is LEARNED, not claimed.
+// Mosaic protocol v1 — location is LEARNED, not claimed.
 // The firmware reports the real BSSID of the AP it's connected to;
 // the brain maps BSSID → label ("home", "gym", ...). See docs/protocol.md.
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ORB SENSE ENGINE (NimBLE passive) ===\n");
+  Serial.println("\n=== MOSAIC SENSE ENGINE (NimBLE passive) ===\n");
 
   // Controller-level duplicate filter: DEVICE mode + 200-entry cache.
   // Must be set BEFORE NimBLEDevice::init (same pattern as ESP32Marauder).
@@ -499,10 +499,10 @@ void loop() {
   int count = g_recordCount;
   Serial.printf("Found %d devices\n", count);
 
-  // Report to gateway — ORB protocol v1 envelope with real BSSID
+  // Report to gateway — Mosaic protocol v1 envelope with real BSSID
   if (count > 0 && WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
+    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/ingest";
     String bssid = WiFi.BSSIDstr();
     String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) +
                      "\",\"type\":\"scan\",\"ts\":" + String(millis()) +
