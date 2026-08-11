@@ -274,6 +274,27 @@ def entity_view(c, hours=24):
         if dclass == "findmy":
             label = label if label.startswith(("findmy-", "airtag-")) else f"findmy/{label}"
 
+        # KNOWN = has an earned identity: explicit devices-table label, the
+        # stable flag, or a device-reported name (TV/ThermoBeacon/...). The
+        # findmy-* auto labels are placeholders, not names — rotating AirTag
+        # MACs stay UNKNOWN until someone names the underlying object.
+        named = bool(lbl and lbl["label"]) or bool(s["name"] and dclass != "findmy")
+        known = stable or named
+
+        # Operator tier (mission-driven order, see sort below):
+        #   0 KNOWN  — the labeled/stable world: "is my entity here?" (M1)
+        #   1 MOVING — the event: what is moving right now (philosophy #5)
+        #   2 STATIC — the stationary world (places/anchors), strongest first
+        #   3 AMBI   — the ambiguous noise floor, last
+        if known:
+            tier = 0
+        elif move_class == "MOVING":
+            tier = 1
+        elif move_class == "STATIC":
+            tier = 2
+        else:
+            tier = 3
+
         rows.append({
             "mac": mac,
             "label": label,
@@ -283,7 +304,16 @@ def entity_view(c, hours=24):
             "class": move_class, "muted": muted,
             "dclass": dclass or "-",
             "place_candidate": dclass == "findmy" and move_class == "STATIC",
+            "known": known, "tier": tier,
         })
+
+    # The old sort (spread desc, from device_stats) let unknown rotating MACs
+    # bury the labeled anchors — the opposite of what an operator checking
+    # "is my world normal?" needs. Re-sort by the mission tiers:
+    # within KNOWN/MOVING keep most-mobile first; within STATIC strongest
+    # signal first (a strong static unknown = close = the M3 anomaly shape,
+    # must not be buried under -100 dB neighbor noise).
+    rows.sort(key=lambda r: (r["tier"], -r["avg"] if r["tier"] == 2 else -r["spread"]))
     return rows
 
 
@@ -298,7 +328,10 @@ def print_entity_view(rows, limit=40):
         stable_m = "*" if r["stable"] else " "
         pc = "PLACE?" if r["place_candidate"] else ""
         print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['spread_raw']:>4} {r['n']:>5}  {r['mac']} {mark} {pc}")
-    print("  spr = robust p10-p90 spread (outlier-proof); raw = max-min")
+    tiers = ("KNOWN", "MOVING", "STATIC", "AMBI")
+    counts = {t: sum(1 for r in rows if r["tier"] == i) for i, t in enumerate(tiers)}
+    summary = " · ".join(f"{t}={counts[t]}" for t in tiers)
+    print(f"  {summary}  (of {len(rows)} devices; spr = robust p10-p90 spread, raw = max-min)")
 
 
 def collapse_chains(rows, min_weight=0.7):
