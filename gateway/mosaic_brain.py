@@ -87,6 +87,22 @@ DEFAULT_WM = {
     # while tolerating RSSI drift.
     "stream_max_gap_seconds": 600,      # max B.first - A.last for a stream edge
     "stream_level_gate": 4,             # dB: |avgA - avgB| for a stream edge
+    # Lockstep (Aug 11): one physical object can advertise TWO parallel BLE
+    # identities (the desk iPhone rotates a company-76 and a company-301 MAC
+    # in lockstep: same -43dB level, ~14 min cadence each, rotations aligned
+    # within 0-2 min for 25 consecutive rotations). The chains stay separate
+    # (different companies never merge into one slot) but the LOCKSTEP pattern
+    # identifies them as ONE object with TWO slots. Two independent devices
+    # (e.g. two AirTags) rotate on their own schedules — alignment fails.
+    "lockstep_min_macs": 4,             # min chain size to even consider
+    "lockstep_level_gate": 4,           # dB: |avgA - avgB| (same as stream gate)
+    "lockstep_cadence_tol": 1.5,        # cadence ratio A/B within [1/tol, tol]
+    "lockstep_align_window_seconds": 180,  # rotation events within this = aligned
+    "lockstep_gap_min_minutes": 6,      # silence this long = a real absence
+    "lockstep_gap_global_frac": 0.5,    # gap mostly silent WORLDWIDE = node artifact
+    "lockstep_gap_align_minutes": 5,    # shared gaps must START within this
+    "lockstep_gap_min_shared_minutes": 15,  # shared overlap must be this long
+    "lockstep_gap_shared_min": 0.5,     # min shared fraction of the shorter list
 }
 
 
@@ -481,6 +497,257 @@ def print_chains(c, hours=24):
     return chains
 
 
+def _chain_meta(macs, chain):
+    """Aggregate a chain's members: level, span, rotation events, cadence.
+
+    Rotation event = a successor MAC's first appearance (the identity
+    changed). Cadence = median gap between consecutive rotation events.
+    Returns dict or None when the chain is too small to reason about."""
+    from datetime import datetime
+    mem = [macs[m] for m in chain if m in macs]
+    if len(mem) < 3:
+        return None
+    mem.sort(key=lambda m: m["first_ts"])
+    avg = sum(m["avg_rssi"] for m in mem) / len(mem)
+    span_s = (datetime.fromisoformat(mem[-1]["last_ts"].replace("Z", "+00:00"))
+              - datetime.fromisoformat(mem[0]["first_ts"].replace("Z", "+00:00"))).total_seconds()
+    events = []
+    for m in mem[1:]:
+        events.append(datetime.fromisoformat(m["first_ts"].replace("Z", "+00:00")))
+    gaps = [(b - a).total_seconds() for a, b in zip(events[:-1], events[1:])]
+    cadence = sorted(gaps)[len(gaps) // 2] if gaps else None
+    company = next((m["company_id"] for m in mem if m["company_id"]), None)
+    cls = next((m["device_class"] for m in mem if m["device_class"]), None)
+    return {"chain": chain, "n": len(chain), "avg": avg, "span_s": span_s,
+            "events": events, "cadence_s": cadence, "company": company,
+            "cls": cls, "first": mem[0]["first_ts"], "last": mem[-1]["last_ts"]}
+
+
+def _chain_gaps(mac_minutes, chain, gap_min_minutes=6):
+    """Absence intervals of a chain: silent runs >= gap_min_minutes within
+    the chain's active span. A chain's presence = union of its members'
+    active minutes (all slots of one identity)."""
+    from datetime import timedelta
+    mins = set()
+    for m in chain:
+        mins |= mac_minutes.get(m, set())
+    if not mins:
+        return []
+    active = sorted(mins)
+    t = active[0]
+    end = active[-1]
+    gaps = []
+    silent_start = None
+    while t <= end:
+        if t in mins:
+            if silent_start is not None:
+                if (t - silent_start).total_seconds() >= gap_min_minutes * 60:
+                    gaps.append((silent_start, t))
+                silent_start = None
+        else:
+            if silent_start is None:
+                silent_start = t
+        t += timedelta(minutes=1)
+    if silent_start is not None and (end - silent_start).total_seconds() >= gap_min_minutes * 60:
+        gaps.append((silent_start, end + timedelta(minutes=1)))
+    return gaps
+
+
+def _group_streams(metas, level_gate):
+    """Merge chains into IDENTITY STREAMS.
+
+    A rotating identity (one company+class at one level) gets SPLIT into
+    multiple chains whenever it is absent longer than stream_max_gap (the
+    95-min departure splits the desk phone into night+day chains). Chains
+    with the same company+class whose levels agree and whose spans are
+    SEQUENTIAL (no overlap) are one continuing identity = one stream.
+    Overlapping chains are parallel identities (two findmy devices alive
+    at once) and stay separate streams.
+    """
+    by_key = {}
+    for m in metas:
+        by_key.setdefault((m["company"], m["cls"]), []).append(m)
+    streams = []
+    for key, ms in by_key.items():
+        ms.sort(key=lambda m: m["first"])
+        for m in ms:
+            best_idx = -1
+            for idx, s in enumerate(streams):
+                if s["company"] != key[0] or s["cls"] != key[1]:
+                    continue
+                if abs(s["avg"] - m["avg"]) > level_gate:
+                    continue
+                # sequential: new chain starts after the stream's last end
+                if m["first"] < s["last"]:
+                    continue
+                # prefer the stream with the earliest end among candidates
+                if best_idx < 0 or s["last"] < streams[best_idx]["last"]:
+                    best_idx = idx
+            if best_idx >= 0:
+                streams[best_idx]["chains"].append(m)
+                streams[best_idx]["last"] = max(streams[best_idx]["last"], m["last"])
+                n = streams[best_idx]["n"] + m["n"]
+                streams[best_idx]["n"] = n
+                streams[best_idx]["avg"] = (streams[best_idx]["avg"] * (n - m["n"]) + m["avg"] * m["n"]) / n
+                streams[best_idx]["events"].extend(m["events"])
+                streams[best_idx]["cadences"].append(m["cadence_s"])
+            else:
+                streams.append({"company": key[0], "cls": key[1], "chains": [m],
+                                "n": m["n"], "avg": m["avg"],
+                                "first": m["first"], "last": m["last"],
+                                "events": list(m["events"]),
+                                "cadences": [m["cadence_s"]]})
+    for s in streams:
+        s["events"].sort()
+        s["cadence_s"] = sorted(s["cadences"])[len(s["cadences"]) // 2]
+        s["macs"] = [mac for m in s["chains"] for mac in m["chain"]]
+    return streams
+
+
+def lockstep_pairs(c, hours=24, report=True):
+    """Parallel-identity detection: identity streams that co-move = ONE object.
+
+    The desk iPhone advertises TWO BLE identities (company 76 + company 301)
+    at the same -43 dB level on independent ~14 min rotation timers. The
+    timers run at slightly different periods, so rotation alignment beats and
+    is NOT reliable evidence (two same-cadence rotators align by chance ~70%
+    of the time). Cadence match is weak too (all Apple devices rotate on
+    similar timers).
+
+    The reliable signature is SHARED ABSENCE: when the object leaves, ALL of
+    its identities leave together and return together. Gaps must be
+    device-level (a gap that is silent WORLDWIDE is a node/gateway outage,
+    not co-movement — the 05:00-06:36 gateway death looked like a shared
+    departure until the global check caught it), start-aligned (departure
+    is simultaneous), and long enough to be real. Level match screens
+    candidates; shared absence confirms.
+
+    Chains are first grouped into identity streams (same company+class+level,
+    sequential spans) so that departures longer than the stream-bind gap
+    don't hide the absence. Confirmed pairs are ONE object with two slots.
+    Chains/streams are never merged: identities stay separate slots.
+    """
+    wm = WM
+    min_macs = wm.get("lockstep_min_macs", 4)
+    level_gate = wm.get("lockstep_level_gate", 4)
+    align_win = wm.get("lockstep_align_window_seconds", 180)
+    gap_min = wm.get("lockstep_gap_min_minutes", 6)
+    gap_global_frac = wm.get("lockstep_gap_global_frac", 0.5)
+    gap_align = wm.get("lockstep_gap_align_minutes", 5)
+    gap_min_shared = wm.get("lockstep_gap_min_shared_minutes", 15)
+    gap_shared_min = wm.get("lockstep_gap_shared_min", 0.5)
+
+    rows, macs = analyze_handoffs(c, hours, report=False, return_macs=True)
+    chains = collapse_chains(rows, macs)
+    metas = [m for m in (_chain_meta(macs, ch) for ch in chains) if m
+             and m["n"] >= min_macs and m["cadence_s"]]
+
+    # per-MAC minute presence (same query the handoff layer uses)
+    cur = c.execute("""
+    SELECT mac, substr(received_at,1,16) AS minute
+    FROM sightings
+    WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
+    GROUP BY mac, minute
+    """, (f"-{hours} hours",))
+    from datetime import datetime, timedelta
+    mac_minutes = {}
+    global_minutes = set()
+    for mac, minute in cur.fetchall():
+        mac_minutes.setdefault(mac, set()).add(datetime.fromisoformat(minute))
+        global_minutes.add(datetime.fromisoformat(minute))
+    for m in metas:
+        m["gaps"] = _chain_gaps(mac_minutes, m["chain"], gap_min)
+
+    streams = _group_streams(metas, level_gate)
+    for s in streams:
+        gaps = _chain_gaps(mac_minutes, s["macs"], gap_min)
+        # tag node-level gaps: mostly silent WORLDWIDE (gateway/node outage
+        # silences every device — that is not co-movement, it is an artifact;
+        # the 05:00-06:36 gateway death looked like a shared departure)
+        tagged = []
+        for ga in gaps:
+            tot = int((ga[1] - ga[0]).total_seconds() // 60)
+            silent = sum(1 for i in range(tot)
+                         if ga[0] + timedelta(minutes=i) not in global_minutes)
+            tagged.append((ga, silent / tot if tot else 1.0))
+        s["gaps"] = [ga for ga, frac in tagged if frac < gap_global_frac]
+        s["global_gaps"] = sum(1 for _ga, frac in tagged if frac >= gap_global_frac)
+
+    def fmt_ts(iso):
+        return iso[11:19] if iso else "-"
+
+    if report:
+        print(f"\nIDENTITY STREAMS ({len(streams)} — rotating identities, {hours}h window):")
+        print(f"{'#':>2} {'n':>3} {'co':>5} {'class':>8} {'avg':>6} {'cadence':>8} {'absences':>9}  first→last")
+        print("-" * 78)
+        for i, s in enumerate(streams):
+            cad = f"{s['cadence_s']/60:.1f}min" if s["cadence_s"] else "-"
+            glob = f" (+{s['global_gaps']} node)" if s.get("global_gaps") else ""
+            print(f"{i:>2} {s['n']:>3} {str(s['company'] or '-'):>5} {str(s['cls'] or '-'):>8} "
+                  f"{s['avg']:>6.1f} {cad:>8} {len(s['gaps']):>9}{glob}  {fmt_ts(s['first'])}→{fmt_ts(s['last'])}")
+
+    # alignment fraction (informational — beat drift makes it weak evidence)
+    def align_frac(A, B):
+        short, long = (A, B) if len(A["events"]) <= len(B["events"]) else (B, A)
+        aligned = sum(1 for e in short["events"]
+                      if any(abs((e - f).total_seconds()) <= align_win for f in long["events"]))
+        return aligned, len(short["events"])
+
+    confirmed, candidates = [], []
+    for i in range(len(streams)):
+        for j in range(i + 1, len(streams)):
+            A, B = streams[i], streams[j]
+            if abs(A["avg"] - B["avg"]) > level_gate:
+                continue
+            if tier_of(A["avg"]) != tier_of(B["avg"]):
+                continue
+            al, tot = align_frac(A, B)
+            ratio = A["cadence_s"] / B["cadence_s"] if A["cadence_s"] and B["cadence_s"] else 0
+            # shared-absence evidence: gaps of the shorter list that are
+            # START-ALIGNED with a gap of the other stream (departure is
+            # simultaneous; return can lag — one identity may resume late)
+            # and share a real overlap (>= gap_min_shared minutes). Mere
+            # containment is not alignment (a 3h gap that happens to contain
+            # another's 1h gap is not co-movement).
+            short_g, long_g = (A["gaps"], B["gaps"]) if len(A["gaps"]) <= len(B["gaps"]) else (B["gaps"], A["gaps"])
+            shared = []
+            for ga in short_g:
+                for gb in long_g:
+                    if abs((ga[0] - gb[0]).total_seconds()) > gap_align * 60:
+                        continue
+                    overlap = (min(ga[1], gb[1]) - max(ga[0], gb[0])).total_seconds()
+                    if overlap >= gap_min_shared * 60:
+                        shared.append(ga)
+                        break
+            if short_g and len(shared) / len(short_g) >= gap_shared_min:
+                confirmed.append((A, B, shared, al, tot, ratio))
+            else:
+                candidates.append((A, B, shared, al, tot, ratio))
+
+    if report:
+        print(f"\nLOCKSTEP OBJECTS ({len(confirmed)} — co-moving identity streams = ONE object):")
+        if not confirmed:
+            print("  (none — no shared-absence evidence in window)")
+        for A, B, shared, al, tot, ratio in sorted(confirmed, key=lambda p: -p[3]):
+            print("-" * 78)
+            print(f"  A: #{streams.index(A)} {A['n']} MACs co={A['company']} class={A['cls']} "
+                  f"avg={A['avg']:.1f} cadence={A['cadence_s']/60:.1f}min {fmt_ts(A['first'])}→{fmt_ts(A['last'])}")
+            print(f"  B: #{streams.index(B)} {B['n']} MACs co={B['company']} class={B['cls']} "
+                  f"avg={B['avg']:.1f} cadence={B['cadence_s']/60:.1f}min {fmt_ts(B['first'])}→{fmt_ts(B['last'])}")
+            for ga in shared[:4]:
+                print(f"     shared absence: {ga[0].strftime('%H:%M')}→{ga[1].strftime('%H:%M')} "
+                      f"({int((ga[1]-ga[0]).total_seconds()//60)}min) — left together")
+            print(f"     level Δ={abs(A['avg']-B['avg']):.1f}dB · cadence ratio={ratio:.2f} · "
+                  f"rotation alignment {al}/{tot} within {align_win//60}min (beat-drifts) → ONE object, 2 slots")
+
+        print(f"\nCO-LOCATED CANDIDATES ({len(candidates)} — level-matched, no shared absence):")
+        for A, B, shared, al, tot, ratio in candidates:
+            print(f"  #{streams.index(A)}/{streams.index(B)}: level Δ={abs(A['avg']-B['avg']):.1f}dB "
+                  f"cadence {A['cadence_s']/60:.1f} vs {B['cadence_s']/60:.1f}min "
+                  f"alignment {al}/{tot} — no departure in window; unresolved")
+    return confirmed
+
+
 def tier_of(avg):
     """LAYER 1: signal quality floor. STRONG resolves, EDGE counts only."""
     if avg >= -70:
@@ -840,6 +1107,8 @@ def main():
     ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
     ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
     ap.add_argument("--chains", action="store_true", help="collapse handoffs into entity chains")
+    ap.add_argument("--lockstep", action="store_true",
+                    help="detect parallel-identity objects (chains rotating in lockstep)")
     ap.add_argument("--places", action="store_true", help="BSSID registry → PLACE entities")
     ap.add_argument("--probes", action="store_true", help="probe-request identity log")
     ap.add_argument("--backfill-beacons", action="store_true",
@@ -862,6 +1131,8 @@ def main():
         analyze_handoffs(c, args.hours)
     if args.chains:
         print_chains(c, args.hours)
+    if args.lockstep:
+        lockstep_pairs(c, args.hours)
     if args.places:
         print_places(places_view(c))
     if args.probes:
@@ -871,8 +1142,8 @@ def main():
     if args.where:
         where_view(c, args.where)
     if not (args.status or args.devices or args.seed_labels or args.bind_slots
-            or args.handoffs or args.chains or args.places or args.probes
-            or args.backfill_beacons or args.where):
+            or args.handoffs or args.chains or args.lockstep or args.places
+            or args.probes or args.backfill_beacons or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 

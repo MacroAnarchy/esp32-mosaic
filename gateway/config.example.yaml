@@ -88,3 +88,18 @@ world_model:
   # live data: 20-23s; the rotation period is the ceiling for missed scans.
   stream_max_gap_seconds: 600   # max B.first - A.last for a stream edge
   stream_level_gate: 4          # dB: |avgA - avgB| for a stream edge
+
+  # Lockstep (parallel identities): one physical object can advertise TWO
+  # BLE identities (the desk phone rotates a company-76 and a company-301
+  # MAC at the same level on independent ~14 min timers — the timers drift,
+  # so rotation alignment beats and is NOT reliable evidence). The reliable
+  # signature is SHARED ABSENCE: when the object leaves, ALL its identities
+  # leave together (measured: both silent 05:01→06:36 to the minute).
+  # Confirmed pairs = ONE object with two slots. Chains are never merged.
+  lockstep_min_macs: 4              # min chain size to consider
+  lockstep_level_gate: 4            # dB: |avgA - avgB|
+  lockstep_cadence_tol: 1.5         # cadence ratio A/B within [1/tol, tol]
+  lockstep_align_window_seconds: 180  # alignment window (informational only)
+  lockstep_gap_min_minutes: 6       # silence this long = a real absence
+  lockstep_gap_overlap_minutes: 3   # gaps overlap this much = shared
+  lockstep_gap_shared_min: 0.5      # min shared fraction of the shorter list
