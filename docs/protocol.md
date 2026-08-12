@@ -131,6 +131,55 @@ no beacon spam. *Added v1.2 (WiFi scan port).*
 - `frames[].rssi` = received signal strength in dBm.
 - After the sweep the node MUST rejoin WiFi before reporting; if the join fails it keeps retrying on subsequent cycles while BLE sensing continues (a node that can't rejoin is dead).
 
+### `arp_join` / `arp_leave` — WiFi neighbor join/leave events (ARP)
+The node is an ordinary WiFi client, so it participates in ARP like any
+other host on the subnet: every station learns its neighbors by asking
+"who has IP X?". Every `arp_interval_seconds` (default 60) the node
+ARP-probes its own subnet (range derived from its live IP + netmask),
+keeps a seen-table of MAC→IP pairs with first/last-seen, and reports
+transitions:
+
+- a MAC that appears → `arp_join`
+- a MAC unseen for `arp_leave_timeout_intervals` consecutive cycles
+  (default 3 × 60s ≈ 3 min) → `arp_leave`
+
+This is standard, legal network membership traffic — no injection, no
+promiscuous mode, nothing beyond what every station does. On APs with
+client isolation the probes simply go unanswered: the node sees no
+neighbors, emits no events, and stays silent. *Added v1.3 (ARP neighbor discovery).*
+
+```json
+{
+  "type": "arp_join",
+  "payload": {
+    "ap_bssid": "aa:bb:cc:dd:ee:ff",
+    "mac": "11:22:33:44:55:66",
+    "ip": "192.168.1.42",
+    "first_seen": 1754240000000,
+    "last_seen": 1754240000000
+  }
+}
+```
+
+```json
+{
+  "type": "arp_leave",
+  "payload": {
+    "ap_bssid": "aa:bb:cc:dd:ee:ff",
+    "mac": "11:22:33:44:55:66",
+    "ip": "192.168.1.42",
+    "first_seen": 1754239000000,
+    "last_seen": 1754240000000
+  }
+}
+```
+- `ap_bssid` = BSSID of the AP the node is currently associated with (location fingerprint, same as `scan`).
+- `mac` = the neighbor's MAC as learned from its ARP reply. Unlike BLE MACs this is the real, stable device MAC (the node's ARP table only holds members of its own subnet).
+- `ip` = the neighbor's IPv4 address on the node's subnet.
+- `first_seen` / `last_seen` = node-clock epoch ms of the first / most recent sighting (best effort, server stamps the real time).
+- A MAC that changes IP (DHCP renumber) is re-reported under the same identity — the node keeps `first_seen`, only `ip`/`last_seen` update.
+- Join events are intended for server-side entity confirmation: a MAC with a live IP on the node's subnet is stronger evidence of presence than a radio sighting alone (e.g. it can split two co-located devices that look identical to BLE).
+
 ### `csi` — radar/presence event from CSI processing
 ```json
 {
