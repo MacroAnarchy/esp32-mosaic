@@ -118,6 +118,17 @@ world_model:
   # stale crisply when the person walks out with the device).
   owner_label_prefix: OWNER_        # set to your deployment's label namespace
   owner_present_seconds: 600        # 10 min, default
+  # Owner assignment cooldown (churn killer): owner-class devices at one
+  # RSSI level rotate MACs every 1-3 min, so the plain best-fit pick flips
+  # which device answers for which identity on every query. The resolver
+  # HOLDS the last pick per seed (persisted to ~/.orb/owner_assignment.json,
+  # shared by --owner and --where): it re-assigns only when the held
+  # candidate is absent longer than owner_cooldown_absent_seconds (a real
+  # rotation has happened) or a new candidate's level fit is more than
+  # owner_cooldown_improve_db better (a genuinely better answer, not
+  # rotation noise).
+  owner_cooldown_absent_seconds: 600  # release the hold after this silence
+  owner_cooldown_improve_db: 2.0      # switch only when fit improves > this
 
   # Channel health (the --status / --channels heartbeat): per-channel max
   # age before a channel reads STALE (2x = OFFLINE). scan/wifi are periodic

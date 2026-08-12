@@ -36,6 +36,10 @@ from datetime import datetime, timedelta, timezone
 DB = os.path.expanduser("~/.orb/orb.db")
 LABELS_FILE = os.path.expanduser("~/.mosaic/device_labels.json")
 LOCATIONS_FILE = os.path.expanduser("~/.orb/locations.json")
+# Owner-assignment cooldown cache (runtime state, next to the DB — never in
+# the repo): the last candidate pick per owner seed, so minute-scale MAC
+# rotation churn cannot flip the per-seed identity answer on every query.
+OWNER_CACHE_FILE = os.path.expanduser("~/.orb/owner_assignment.json")
 
 # Time-window filter normalization.
 # received_at is stored ISO-8601 ('2026-08-10T22:37:33+00:00') while SQLite's
@@ -145,6 +149,17 @@ DEFAULT_WM = {
     # scan gaps while staying crisp for a person walking out).
     "owner_label_prefix": "OWNER_",
     "owner_present_seconds": 600,
+    # Owner assignment cooldown (Aug 12): the owner-class devices at desk
+    # level rotate MACs every 1-3 min, so the plain no-reuse best-fit pick
+    # flips which candidate answers for which seed on almost every query
+    # ('ask twice, get different MACs' — the 07:12 MEDIUM). The resolver
+    # now HOLDS the last pick per seed (persisted to ~/.orb/owner_assignment.json)
+    # and only re-assigns when the held candidate is absent longer than
+    # owner_cooldown_absent_seconds (a real rotation has clearly happened)
+    # or a new candidate's level fit is > owner_cooldown_improve_db better
+    # (a genuinely better answer — not rotation noise).
+    "owner_cooldown_absent_seconds": 600,
+    "owner_cooldown_improve_db": 2.0,
     # Channel health (Aug 11): the --status heartbeat surface. Per-channel
     # max age before a channel reads STALE (2x = OFFLINE). scan/wifi are
     # periodic streams (the node scans every ~20s, wifi cycle every few min).
@@ -483,7 +498,7 @@ def _level_candidates(macs, slot, anchor_avg, level_gate, present_s, now):
     return cands
 
 
-def _no_reuse_assign(pending):
+def _no_reuse_assign(pending, exclude=None, skip=None):
     """Global no-reuse assignment across stale-slot seeds.
 
     Best level fit (smallest |Δ|) claims first; ties break by label for
@@ -492,14 +507,22 @@ def _no_reuse_assign(pending):
     one object advertising parallel streams must not double-count as
     phone AND watch). Shared by owner_view (M1) and where_view's chain
     path so both commands always agree on which candidate answers for
-    which seed.
+    which seed. `exclude` = MACs already claimed elsewhere (the cooldown
+    holds of _stabilized_assign) — they are not re-claimed here.
+    `skip` = pending indices that already hold a claim — they must not
+    participate in the fresh greedy at all (a seed showing its held pick
+    must not phantom-claim a candidate for itself).
     Returns (assigned, claimed_by): assigned[pending-index] -> candidate
     mac, claimed_by[mac] -> {"label": ..., "delta": ...}.
     """
     pairs = []
     for i, p in enumerate(pending):
+        if skip and i in skip:
+            continue
         anchor = p["res"]["anchor_avg"]
         for m in p["cands"]:
+            if exclude and m["mac"] in exclude:
+                continue
             pairs.append((abs(m["avg_rssi"] - anchor), i, m))
     pairs.sort(key=lambda t: (t[0], pending[t[1]]["seed"]["label"]))
     claimed_by = {}  # candidate mac -> {"label": ..., "delta": ...}
@@ -511,6 +534,134 @@ def _no_reuse_assign(pending):
         claimed_by[m["mac"]] = {"label": pending[i]["seed"]["label"],
                                 "delta": delta}
     return assigned, claimed_by
+
+
+def _load_owner_cache():
+    """Read the owner-assignment cooldown cache (best-effort).
+
+    Missing/corrupt cache = empty dict — the resolver degrades to the
+    plain no-reuse assignment, never crashes. The file lives next to the
+    DB (runtime state, never in the repo).
+    """
+    try:
+        with open(OWNER_CACHE_FILE) as f:
+            data = json.load(f)
+        seeds = data.get("seeds") or {}
+        return {k: v for k, v in seeds.items()
+                if isinstance(v, dict) and v.get("cand")}
+    except Exception:
+        return {}
+
+
+def _save_owner_cache(cache):
+    """Persist the cooldown cache atomically (tmp + rename, best-effort)."""
+    try:
+        payload = {"v": 1,
+                   "updated": datetime.now(timezone.utc).isoformat(
+                       timespec="seconds"),
+                   "seeds": cache}
+        path = OWNER_CACHE_FILE
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _stabilized_assign(pending, cache, macs, now):
+    """No-reuse assignment with per-seed cooldown holds (churn killer).
+
+    The owner-class cluster rotates MACs every 1-3 min at one RSSI level,
+    so the plain greedy best-fit pick flips which candidate answers for
+    which seed on almost every query. Each seed with a VALID cache entry
+    HOLDS its last pick: the held candidate keeps answering while it is
+    still level-matched and was seen within owner_cooldown_absent_seconds
+    (a rotation just happened — the physical object did not move), unless
+    a fresh candidate's level fit is > owner_cooldown_improve_db better
+    (a genuinely better answer). Holds claim BEFORE fresh best-fit picks,
+    so a seed's identity does not flip when a slightly-better-fitting
+    MAC appears mid-rotation; the global no-reuse rule still holds (one
+    device never answers for two identities — a seed whose held pick is
+    claimed by a better-fitting seed falls back to the fresh pool).
+    Never invents presence: a seed with no fresh level-matched candidate
+    in the pool gets no assignment regardless of the cache.
+    Returns (assigned, claimed_by, new_cache): assigned/claimed_by as in
+    _no_reuse_assign (claimed_by includes holds), new_cache = the cache
+    dict reflecting this run's final picks (entries dropped for seeds
+    that ended without an assignment).
+    """
+    level_gate = WM.get("stream_level_gate", 4)
+    present_s = WM.get("owner_present_seconds", 600)
+    absent_s = WM.get("owner_cooldown_absent_seconds", 600)
+    improve_db = WM.get("owner_cooldown_improve_db", 2.0)
+
+    # Fresh no-reuse baseline: the best fit per seed without any hold.
+    fresh_assigned, _ = _no_reuse_assign(pending)
+
+    holds = []  # (delta, label, pending-index, mac)
+    for i, p in enumerate(pending):
+        c = (cache or {}).get(p["seed"]["mac"])
+        if not c:
+            continue
+        m = macs.get(c["cand"])
+        if m is None:
+            continue  # candidate fell out of the window — hold is dead
+        ld = _parse_ts(m["last_ts"])
+        if ld is None:
+            continue
+        age = (now - ld).total_seconds()
+        if age > absent_s:
+            continue  # gone too long — adopt the new rotation
+        delta = abs(m["avg_rssi"] - p["res"]["anchor_avg"])
+        if delta > level_gate:
+            continue  # the object moved level — hold is stale
+        best_mac = fresh_assigned.get(i)
+        if best_mac and best_mac != c["cand"]:
+            best = macs[best_mac]
+            best_delta = abs(best["avg_rssi"] - p["res"]["anchor_avg"])
+            if delta - best_delta > improve_db:
+                continue  # a genuinely better answer exists — switch
+        holds.append((delta, p["seed"]["label"], i, c["cand"]))
+
+    # Phase 1: valid holds claim first (better fit wins on conflict).
+    holds.sort(key=lambda t: (t[0], t[1]))
+    assigned = {}
+    claimed_by = {}
+    for delta, label, i, mac in holds:
+        if i in assigned or mac in claimed_by:
+            continue
+        assigned[i] = mac
+        claimed_by[mac] = {"label": label, "delta": delta}
+
+    # Phase 2: seeds WITHOUT a hold claim from the remaining pool (seeds
+    # that already hold must not participate — a seed showing its held
+    # pick must not phantom-claim a candidate for itself and starve a
+    # hold-less seed of its best fit).
+    fresh, fresh_claims = _no_reuse_assign(pending,
+                                           exclude=set(claimed_by),
+                                           skip=set(assigned))
+    for i, mac in fresh.items():
+        if i not in assigned:
+            assigned[i] = mac
+    claimed_by.update(fresh_claims)
+
+    # New cache: keep only seeds that ended with an assignment.
+    new_cache = {}
+    for i, p in enumerate(pending):
+        mac = assigned.get(i)
+        if mac is None:
+            continue
+        m = macs[mac]
+        new_cache[p["seed"]["mac"]] = {
+            "cand": mac,
+            "avg": m["avg_rssi"],
+            "delta": abs(m["avg_rssi"] - p["res"]["anchor_avg"]),
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    return assigned, claimed_by, new_cache
 
 
 def owner_view(c, hours=24, report=True):
@@ -578,10 +729,16 @@ def owner_view(c, hours=24, report=True):
                                   level_gate, present_s, now)
         pending.append({"seed": s, "row": row, "res": res, "cands": cands})
 
-    # Global no-reuse assignment (shared helper — where_view uses the same
-    # one, so both commands agree): best level fit (smallest |Δ|) claims
-    # first; ties break by label. Each candidate serves one seed.
-    assigned, claimed_by = _no_reuse_assign(pending)
+    # Global no-reuse assignment with per-seed cooldown holds (shared
+    # machinery — where_view uses the same, so both commands agree):
+    # each seed HOLDS its last pick while it stays fresh/level-matched,
+    # so minute-scale MAC rotation cannot flip which device answers for
+    # which identity (the 07:12 churn MEDIUM). The hold is persisted to
+    # ~/.orb/owner_assignment.json and survives across runs.
+    cache = _load_owner_cache()
+    assigned, claimed_by, new_cache = _stabilized_assign(pending, cache,
+                                                         macs, now)
+    _save_owner_cache(new_cache)
 
     for i, p in enumerate(pending):
         row, res = p["row"], p["res"]
@@ -611,10 +768,12 @@ def owner_view(c, hours=24, report=True):
         m = macs[mac]
         ld = _parse_ts(m["last_ts"])
         cd = (now - ld).total_seconds() if ld else present_s + 1
+        held = " [held]" if (cache or {}).get(p["seed"]["mac"],
+                                              {}).get("cand") == mac else ""
         row["candidate"] = (f"{m['mac']} @ {m['avg_rssi']:.1f} dB "
                             f"(Δ{abs(m['avg_rssi']-anchor_avg):.1f}) "
                             f"co={m['company_id'] or '-'} last {int(cd)}s ago "
-                            f"— owner-shaped, unbound")
+                            f"— owner-shaped, unbound{held}")
         row["state"] = "PROBABLE"
         row["detail"] = (f"slot ended {age/3600:.1f}h ago, but an owner-shaped "
                          f"device is ACTIVE now ({int(cd)}s ago @ {m['avg_rssi']:.1f} "
@@ -656,7 +815,10 @@ def print_owner_view(out):
           "owner-shaped device is ACTIVE at seed level now (unbound until "
           "WiFi-join confirmation) · STALE = no owner-shaped evidence in window · "
           "UNRESOLVED = the only level-matched device is already claimed by "
-          "another seed — one device never answers for two identities")
+          "another seed — one device never answers for two identities · "
+          "[held] = this pick is held from the last run (rotation cooldown: "
+          "the answer only changes when the held device is gone >10min or a "
+          "fit >2dB better appears)")
 
 
 def channel_health(c, report=True):
@@ -1539,13 +1701,15 @@ def backfill_beacons(c):
 
 
 def _owner_assignment(c, macs, slot_of):
-    """The owner resolver's no-reuse assignment, recomputed for where_view.
+    """The owner resolver's stabilized no-reuse assignment for where_view.
 
-    Same seed set, same candidate collection, same greedy claim order as
-    owner_view — so --where and --owner always agree on which candidate
-    answers for which owner seed, and a queried non-owner seed can check
-    whether its best candidate is already claimed (one device never
-    answers for two identities).
+    Same seed set, same candidate collection, same claim order + the same
+    per-seed cooldown holds as owner_view — so --where and --owner always
+    agree on which candidate answers for which owner seed (and a queried
+    non-owner seed can check whether its best candidate is already
+    claimed: one device never answers for two identities). Persists the
+    cooldown cache exactly like owner_view, so either command can
+    release/refresh a hold and the next command sees the same answer.
     Returns (assign_by_seed_mac, claimed_by): assign_by_seed_mac maps
     seed MAC -> candidate MAC for seeds that won a claim; claimed_by maps
     candidate MAC -> {"label": ..., "delta": ...}.
@@ -1567,7 +1731,10 @@ def _owner_assignment(c, macs, slot_of):
         cands = _level_candidates(macs, slot_of.get(s["mac"]) or [s["mac"]],
                                   res["anchor_avg"], level_gate, present_s, now)
         pending.append({"seed": s, "res": res, "cands": cands})
-    assigned, claimed_by = _no_reuse_assign(pending)
+    cache = _load_owner_cache()
+    assigned, claimed_by, new_cache = _stabilized_assign(pending, cache,
+                                                         macs, now)
+    _save_owner_cache(new_cache)
     by_mac = {}
     for i, p in enumerate(pending):
         if i in assigned:
