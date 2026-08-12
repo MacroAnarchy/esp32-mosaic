@@ -42,6 +42,10 @@
 // the subnet, track MAC→IP pairs, report join/leave events to the gateway.
 #include "arp_neighbors.h"
 
+// WiFi CSI motion sensing (Tier 1) — monostatic router geometry via the
+// Espressif esp_wifi_sensing component. See csi_sensing.h.
+#include "csi_sensing.h"
+
 #include "sense_common.h"
 #include "sense_engine.h"
 
@@ -348,8 +352,7 @@ static std::string jsonEscape(const std::string &s) {
 
 // Gateway endpoint (from config.h)
 static std::string gatewayIngestUrl() {
-  return std::string("http://") + MOSAIC_GATEWAY_HOST + ":" +
-         std::to_string(MOSAIC_GATEWAY_PORT) + "/ingest";
+  return sense::gateway_ingest_url();
 }
 
 // Envelope payload entry for one device — additive fields only.
@@ -536,6 +539,13 @@ static void runWifiScanCycle() {
   g_wifiFrameCount = 0;
   g_wifiScanActive = true;
 
+#if MOSAIC_CSI_ENABLE
+  // CSI rides the STA association — the radio is about to leave STA mode
+  // for the offline sweep, so pause CSI (stop FSM + router ping). It is
+  // resumed below after the reconnect.
+  csi_sensing_pause();
+#endif  // MOSAIC_CSI_ENABLE
+
   // 1) Drop association, go NULL, enter promiscuous
   esp_wifi_disconnect();
   xEventGroupClearBits(s_wifiEvents, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
@@ -563,6 +573,10 @@ static void runWifiScanCycle() {
     char bssid[MAC_STR_LEN] = "";
     sense_wifi_get_ap_bssid(bssid, sizeof(bssid));
     ESP_LOGI(TAG, "  reconnected. BSSID: %s", bssid);
+#if MOSAIC_CSI_ENABLE
+    // Back on the AP channel — CSI resumes and relearns its baseline.
+    csi_sensing_resume();
+#endif  // MOSAIC_CSI_ENABLE
   } else {
     ESP_LOGW(TAG, "  reconnect FAILED — will keep retrying on next cycle");
   }
@@ -648,9 +662,25 @@ static void senseTask(void *arg) {
   sense_wifi_get_ap_bssid(bssid, sizeof(bssid));
   ESP_LOGI(TAG, "WiFi connected. BSSID: %s", bssid);
 
+#if MOSAIC_CSI_ENABLE
+  // WiFi CSI motion sensing — needs the STA association (AP BSSID + gateway
+  // for ping-assisted sampling). WiFi is up here; on the rare failure just
+  // log — the node keeps sensing BLE/ARP, CSI is additive.
+  esp_err_t csiInit = csi_sensing_init();
+  if (csiInit != ESP_OK) {
+    ESP_LOGW(TAG, "CSI init failed: %s", esp_err_to_name(csiInit));
+  }
+#endif  // MOSAIC_CSI_ENABLE
+
   uint32_t lastWifiScanMs = 0;
 
   while (1) {
+#if MOSAIC_CSI_ENABLE
+    // CSI motion events are drained once per loop (≤ loop period latency)
+    // and POSTed as type:"csi" envelopes. Queue full / gateway down → drop
+    // (lossy by design).
+    csi_sensing_drain_and_report();
+#endif  // MOSAIC_CSI_ENABLE
     // Scan for 5 seconds (callbacks fill g_records meanwhile)
     ESP_LOGI(TAG, "--- BLE scan (5s) ---");
     g_recordCount = 0;
@@ -695,7 +725,14 @@ static void senseTask(void *arg) {
         // BLE keeps collecting. A node that can't rejoin WiFi is dead.
         ESP_LOGI(TAG, "--- WiFi down — retrying join (BLE keeps running) ---");
         wifiJoinBlocking(MOSAIC_WIFI_RECONNECT_TIMEOUT_MS, 1);
-        if (sense_wifi_is_connected()) lastWifiScanMs = sense::uptime_ms();
+        if (sense_wifi_is_connected()) {
+          lastWifiScanMs = sense::uptime_ms();
+#if MOSAIC_CSI_ENABLE
+          // Back online after a failed offline-scan reconnect — bring CSI
+          // back (no-op when CSI is already running or was never started).
+          csi_sensing_resume();
+#endif  // MOSAIC_CSI_ENABLE
+        }
       }
     }
 #endif  // MOSAIC_WIFI_SCAN_ENABLE

@@ -1,0 +1,7 @@
+## IDF Component Manager manifest for components/sense
+## Declares the CSI sensing dependency (Espressif esp_wifi_sensing,
+## Apache-2.0 — fetched from the ESP Component Registry; version pinned in
+## firmware/dependencies.lock). The Arduino [env:esp32] build does not use
+## this manifest (no IDF component manager, and CSI is ESP-IDF only).
+dependencies:
+  esp_wifi_sensing: ">=0.1.1"

@@ -180,7 +180,21 @@ neighbors, emits no events, and stays silent. *Added v1.3 (ARP neighbor discover
 - A MAC that changes IP (DHCP renumber) is re-reported under the same identity — the node keeps `first_seen`, only `ip`/`last_seen` update.
 - Join events are intended for server-side entity confirmation: a MAC with a live IP on the node's subnet is stronger evidence of presence than a radio sighting alone (e.g. it can split two co-located devices that look identical to BLE).
 
-### `csi` — radar/presence event from CSI processing
+### `csi` — WiFi CSI motion events (Tier 1: motion only)
+The node's WiFi radio reads Channel State Information from the traffic of
+the router it is associated with (monostatic geometry — a single node
+listening to its home AP's data/ACK/beacon frames; no dedicated
+transmitter pair). The Espressif `esp_wifi_sensing` component (Apache-2.0,
+built on esp-radar) converts the CSI stream into per-channel motion
+start/stop events; the node reports each transition as a `csi` envelope
+over the same gateway HTTP channel as every other type. A periodic router
+ping keeps the CSI sampling path fed with traffic.
+
+**Tier 1 scope (honest):** motion events only. A still room emits nothing;
+`moved` means radio-visible movement was detected on the channel, `empty`
+means the channel went quiet. Vitals, activity classification and verified
+stationary presence are NOT reported (later tiers, not yet implemented).
+
 ```json
 {
   "type": "csi",
@@ -189,14 +203,23 @@ neighbors, emits no events, and stays silent. *Added v1.3 (ARP neighbor discover
     "someone": true,
     "moved": true,
     "wander": 0.0055,
-    "jitter": 0.5706
+    "jitter": 0.5706,
+    "score": 137
   }
 }
 ```
-- `event` ∈ `empty | present | moving | moved`
-- `someone` = presence flag (someone in room, through walls)
-- `moved` = movement flag
-- `wander`/`jitter` = waveform metrics (implementation detail, kept for debugging)
+- `event` — Tier 1 emits `moved` | `empty`. (`present`/`moving` are reserved for future tiers.)
+- `someone` = radio-visible motion flag — currently always equals `moved` (motion detected ⇒ someone is there). It is NOT a verified stationary presence; a sitting-still person is not detected in Tier 1.
+- `moved` = movement flag (`true` on `moved`, `false` on `empty`).
+- `wander`/`jitter` = latest waveform metrics from the sensing FSM (implementation detail, kept for debugging).
+- `score` = smoothed motion feature value at the transition (component-internal scale; additive field). *Added with the Tier 1 port.*
+
+Radio coexistence: CSI shares the node's normal WiFi STA association (the
+router-based Espressif examples do the same). CSI is paused while the
+node's periodic WiFi offline scan cycle leaves STA mode (see `wifi`
+above) and resumes with a relearned baseline after reconnection. BLE
+scanning time-slices the same 2.4 GHz radio via coexistence arbitration,
+which may thin the CSI sample stream slightly.
 
 ### `imu` — motion/context from the node's IMU
 ```json
