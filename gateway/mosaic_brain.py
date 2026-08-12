@@ -457,6 +457,62 @@ def _seed_slot(slot_of, macs, mac):
             "anchor_avg": anchor_avg, "slot_n": slot_n, "age_s": age}
 
 
+def _level_candidates(macs, slot, anchor_avg, level_gate, present_s, now):
+    """Strong, fresh, level-matched devices OUTSIDE a seed's own slot.
+
+    The candidate surface for a stale slot: an active STRONG device at
+    the seed's signal level (the physical object did not move when its
+    MAC rotated — the level anchor says so). Reported, never auto-bound:
+    labels are earned, WiFi-join stays the confirmation path. Shared by
+    owner_view and where_view so both commands see the same candidate
+    universe (sorted best level fit first).
+    """
+    cands = []
+    for m in macs.values():
+        if m["mac"] in (slot or []):
+            continue
+        if tier_of(m["avg_rssi"]) != "STRONG":
+            continue
+        if abs(m["avg_rssi"] - anchor_avg) > level_gate:
+            continue
+        cd = _parse_ts(m["last_ts"])
+        if cd is None or (now - cd).total_seconds() > present_s:
+            continue
+        cands.append(m)
+    cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
+    return cands
+
+
+def _no_reuse_assign(pending):
+    """Global no-reuse assignment across stale-slot seeds.
+
+    Best level fit (smallest |Δ|) claims first; ties break by label for
+    determinism. One candidate MAC serves at most ONE seed — a strong
+    device never answers for two identities (the dual-radio phone case:
+    one object advertising parallel streams must not double-count as
+    phone AND watch). Shared by owner_view (M1) and where_view's chain
+    path so both commands always agree on which candidate answers for
+    which seed.
+    Returns (assigned, claimed_by): assigned[pending-index] -> candidate
+    mac, claimed_by[mac] -> {"label": ..., "delta": ...}.
+    """
+    pairs = []
+    for i, p in enumerate(pending):
+        anchor = p["res"]["anchor_avg"]
+        for m in p["cands"]:
+            pairs.append((abs(m["avg_rssi"] - anchor), i, m))
+    pairs.sort(key=lambda t: (t[0], pending[t[1]]["seed"]["label"]))
+    claimed_by = {}  # candidate mac -> {"label": ..., "delta": ...}
+    assigned = {}    # pending index -> candidate mac
+    for delta, i, m in pairs:
+        if i in assigned or m["mac"] in claimed_by:
+            continue
+        assigned[i] = m["mac"]
+        claimed_by[m["mac"]] = {"label": pending[i]["seed"]["label"],
+                                "delta": delta}
+    return assigned, claimed_by
+
+
 def owner_view(c, hours=24, report=True):
     """M1 resolver: owner presence through entity chains."""
     ensure_schema(c)
@@ -518,37 +574,14 @@ def owner_view(c, hours=24, report=True):
         # then assigned globally with NO REUSE — one strong device answers
         # for at most ONE identity (two seeds grabbing the same candidate
         # double-counted one device as phone AND watch).
-        cands = []
-        for m in macs.values():
-            if m["mac"] in (slot or [mac]):
-                continue
-            if tier_of(m["avg_rssi"]) != "STRONG":
-                continue
-            if abs(m["avg_rssi"] - anchor_avg) > level_gate:
-                continue
-            cd = _parse_ts(m["last_ts"])
-            if cd is None or (now - cd).total_seconds() > present_s:
-                continue
-            cands.append(m)
-        cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
+        cands = _level_candidates(macs, slot or [mac], anchor_avg,
+                                  level_gate, present_s, now)
         pending.append({"seed": s, "row": row, "res": res, "cands": cands})
 
-    # Global no-reuse assignment: best level fit (smallest |Δ|) claims first;
-    # ties break by label for determinism. Each candidate serves one seed.
-    pairs = []
-    for i, p in enumerate(pending):
-        anchor = p["res"]["anchor_avg"]
-        for m in p["cands"]:
-            pairs.append((abs(m["avg_rssi"] - anchor), i, m))
-    pairs.sort(key=lambda t: (t[0], pending[t[1]]["seed"]["label"]))
-    claimed_by = {}  # candidate mac -> {"label": ..., "delta": ...}
-    assigned = {}    # pending index -> candidate mac
-    for delta, i, m in pairs:
-        if i in assigned or m["mac"] in claimed_by:
-            continue
-        assigned[i] = m["mac"]
-        claimed_by[m["mac"]] = {"label": pending[i]["seed"]["label"],
-                                "delta": delta}
+    # Global no-reuse assignment (shared helper — where_view uses the same
+    # one, so both commands agree): best level fit (smallest |Δ|) claims
+    # first; ties break by label. Each candidate serves one seed.
+    assigned, claimed_by = _no_reuse_assign(pending)
 
     for i, p in enumerate(pending):
         row, res = p["row"], p["res"]
@@ -1505,7 +1538,44 @@ def backfill_beacons(c):
     print(f"backfilled {n} beacon samples from {len(rows)} wifi envelopes.")
 
 
-def _where_chain_path(d, macs, slot_of):
+def _owner_assignment(c, macs, slot_of):
+    """The owner resolver's no-reuse assignment, recomputed for where_view.
+
+    Same seed set, same candidate collection, same greedy claim order as
+    owner_view — so --where and --owner always agree on which candidate
+    answers for which owner seed, and a queried non-owner seed can check
+    whether its best candidate is already claimed (one device never
+    answers for two identities).
+    Returns (assign_by_seed_mac, claimed_by): assign_by_seed_mac maps
+    seed MAC -> candidate MAC for seeds that won a claim; claimed_by maps
+    candidate MAC -> {"label": ..., "delta": ...}.
+    """
+    prefix = WM.get("owner_label_prefix", "OWNER_")
+    seeds = [dict(r) for r in c.execute(
+        "SELECT mac, label, note FROM devices WHERE label LIKE ? ORDER BY label",
+        (prefix + "%",))]
+    present_s = WM.get("owner_present_seconds", 600)
+    level_gate = WM.get("stream_level_gate", 4)
+    now = datetime.now(timezone.utc)
+    pending = []
+    for s in seeds:
+        if macs.get(s["mac"]) is None:
+            continue
+        res = _seed_slot(slot_of, macs, s["mac"])
+        if res is None or res["age_s"] <= present_s:
+            continue
+        cands = _level_candidates(macs, slot_of.get(s["mac"]) or [s["mac"]],
+                                  res["anchor_avg"], level_gate, present_s, now)
+        pending.append({"seed": s, "res": res, "cands": cands})
+    assigned, claimed_by = _no_reuse_assign(pending)
+    by_mac = {}
+    for i, p in enumerate(pending):
+        if i in assigned:
+            by_mac[p["seed"]["mac"]] = assigned[i]
+    return by_mac, claimed_by
+
+
+def _where_chain_path(d, macs, slot_of, owner_assign, owner_claim):
     """Chain-trace branch of where_view: the seed has no fresh sightings.
 
     Resolve the seed through rotation chains to its slot's CURRENT occupant
@@ -1514,6 +1584,11 @@ def _where_chain_path(d, macs, slot_of):
     level-matched STRONG device at the slot's level — same evidence rule as
     owner_view's candidate (never auto-bound: labels are earned). Its zone
     IS the answer to 'where is it right now'.
+
+    The live candidate comes from the SAME no-reuse assignment as --owner:
+    an owner seed shows exactly the candidate the owner resolver assigned
+    it, and a non-owner seed never borrows a candidate an owner seed
+    already claimed — one device cannot answer for two identities.
     """
     res = _seed_slot(slot_of, macs, d["mac"])
     if res is None:
@@ -1535,26 +1610,33 @@ def _where_chain_path(d, macs, slot_of):
         return
     level_gate = WM.get("stream_level_gate", 4)
     now = datetime.now(timezone.utc)
-    cands = []
-    for m in macs.values():
-        if m["mac"] in (slot_of.get(d["mac"]) or [d["mac"]]):
-            continue
-        if tier_of(m["avg_rssi"]) != "STRONG":
-            continue
-        if abs(m["avg_rssi"] - res["anchor_avg"]) > level_gate:
-            continue
-        cd = _parse_ts(m["last_ts"])
-        if cd is None or (now - cd).total_seconds() > present_s:
-            continue
-        cands.append(m)
-    cands.sort(key=lambda m: abs(m["avg_rssi"] - res["anchor_avg"]))
-    if cands:
-        m = cands[0]
+    cands = _level_candidates(macs, slot_of.get(d["mac"]) or [d["mac"]],
+                              res["anchor_avg"], level_gate, present_s, now)
+    # Owner seed: show exactly the shared no-reuse assignment (--owner and
+    # --where then agree on which candidate answers for which seed).
+    if d["mac"] in owner_assign:
+        m = macs[owner_assign[d["mac"]]]
         cd = (now - _parse_ts(m["last_ts"])).total_seconds()
         print(f"  {'':<24} └ live: {m['mac']} @ {m['avg_rssi']:.1f} dB "
               f"(Δ{abs(m['avg_rssi']-res['anchor_avg']):.1f}) "
               f"zone {zone_of(m['avg_rssi'])} last {int(cd)}s ago "
               f"— level-matched, unbound")
+        return
+    if cands:
+        best = cands[0]
+        claim = (owner_claim or {}).get(best["mac"])
+        if claim:
+            print(f"  {'':<24} └ live: the strong level-matched device "
+                  f"({best['mac'][:8]}… @ {best['avg_rssi']:.1f} dB) is "
+                  f"claimed by {claim['label']} (Δ{claim['delta']:.1f}) — "
+                  f"one device cannot answer two identities; awaiting "
+                  f"WiFi-join confirmation")
+        else:
+            cd = (now - _parse_ts(best["last_ts"])).total_seconds()
+            print(f"  {'':<24} └ live: {best['mac']} @ {best['avg_rssi']:.1f} dB "
+                  f"(Δ{abs(best['avg_rssi']-res['anchor_avg']):.1f}) "
+                  f"zone {zone_of(best['avg_rssi'])} last {int(cd)}s ago "
+                  f"— level-matched, unbound")
 
 
 def where_view(c, label):
@@ -1586,6 +1668,7 @@ def where_view(c, label):
                 (d["mac"], w_start)).fetchone()
             quick[d["mac"]] = dict(r) if r and r["n"] else None
         macs = slot_of = None
+        owner_assign = owner_claim = None
         if any(q is None for q in quick.values()):
             rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
             chains = collapse_chains(rows, macs)
@@ -1593,6 +1676,10 @@ def where_view(c, label):
             for ch in chains:
                 for m in ch:
                     slot_of[m] = ch
+            # The live-candidate step must agree with --owner: compute the
+            # SAME no-reuse assignment over the owner seeds (a queried seed
+            # never borrows a candidate another identity already claimed).
+            owner_assign, owner_claim = _owner_assignment(c, macs, slot_of)
         print(f"\nDEVICE '{label}' — resolved through entity chains (168h):")
         print("-" * 78)
         for d in devs:
@@ -1605,7 +1692,7 @@ def where_view(c, label):
                 print(f"  {d['label']:<24} UNSEEN — seed {d['mac']} never sighted "
                       "by the BLE sniffer (WiFi-only identity?)")
             else:
-                _where_chain_path(d, macs, slot_of)
+                _where_chain_path(d, macs, slot_of, owner_assign, owner_claim)
         return
     # Place fallback: label → BSSIDs → current beacon picture (original path).
     locations = load_locations()
