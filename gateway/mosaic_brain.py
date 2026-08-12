@@ -462,7 +462,7 @@ def owner_view(c, hours=24, report=True):
     ensure_schema(c)
     prefix = WM.get("owner_label_prefix", "OWNER_")
     seeds = [dict(r) for r in c.execute(
-        "SELECT mac, label, note FROM devices WHERE label LIKE ?",
+        "SELECT mac, label, note FROM devices WHERE label LIKE ? ORDER BY label",
         (prefix + "%",))]
     if not seeds:
         if report:
@@ -481,6 +481,7 @@ def owner_view(c, hours=24, report=True):
     now = datetime.now(timezone.utc)
 
     out = []
+    pending = []  # stale-slot seeds still needing candidate assignment
     for s in seeds:
         mac = s["mac"]
         row = {"label": s["label"], "seed": mac}
@@ -509,42 +510,100 @@ def owner_view(c, hours=24, report=True):
             row["detail"] = (f"slot active {int(age)}s ago via {row['active_mac']} "
                              f"@ {row['active_avg']:.1f} dB (slot {row['slot_n']} MACs, "
                              f"level {row['anchor_avg']})")
-        else:
-            # owner-shaped candidate: active STRONG device at the seed level,
-            # not part of the seed's own slot. Reported, never auto-bound.
-            cands = []
-            for m in macs.values():
-                if m["mac"] in (slot or [mac]):
-                    continue
-                if tier_of(m["avg_rssi"]) != "STRONG":
-                    continue
-                if abs(m["avg_rssi"] - anchor_avg) > level_gate:
-                    continue
-                cd = _parse_ts(m["last_ts"])
-                if cd is None or (now - cd).total_seconds() > present_s:
-                    continue
-                cands.append(m)
-            cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
-            if cands:
-                # Fresh (≤ present_s) + strong (STRONG tier at seed level) =
-                # the owner-shaped signature is LIVE right now. Headline says
-                # PROBABLE, not STALE: "not home" is a wrong answer when an
-                # owner-shaped device is active at seed level this second.
-                m = cands[0]
-                cd = (now - _parse_ts(m["last_ts"])).total_seconds()
-                row["candidate"] = (f"{m['mac']} @ {m['avg_rssi']:.1f} dB "
-                                    f"(Δ{abs(m['avg_rssi']-anchor_avg):.1f}) "
-                                    f"co={m['company_id'] or '-'} last {int(cd)}s ago "
-                                    f"— owner-shaped, unbound")
-                row["state"] = "PROBABLE"
-                row["detail"] = (f"slot ended {age/3600:.1f}h ago, but an owner-shaped "
-                                 f"device is ACTIVE now ({int(cd)}s ago @ {m['avg_rssi']:.1f} "
-                                 f"dB, slot level {row['anchor_avg']}) — awaiting "
+            out.append(row)
+            continue
+        # stale slot → owner-shaped candidate: active STRONG device at the
+        # seed level, not part of the seed's own slot. Reported, never
+        # auto-bound. Candidates are collected for ALL stale seeds first,
+        # then assigned globally with NO REUSE — one strong device answers
+        # for at most ONE identity (two seeds grabbing the same candidate
+        # double-counted one device as phone AND watch).
+        cands = []
+        for m in macs.values():
+            if m["mac"] in (slot or [mac]):
+                continue
+            if tier_of(m["avg_rssi"]) != "STRONG":
+                continue
+            if abs(m["avg_rssi"] - anchor_avg) > level_gate:
+                continue
+            cd = _parse_ts(m["last_ts"])
+            if cd is None or (now - cd).total_seconds() > present_s:
+                continue
+            cands.append(m)
+        cands.sort(key=lambda m: abs(m["avg_rssi"] - anchor_avg))
+        pending.append({"seed": s, "row": row, "res": res, "cands": cands})
+
+    # Global no-reuse assignment: best level fit (smallest |Δ|) claims first;
+    # ties break by label for determinism. Each candidate serves one seed.
+    pairs = []
+    for i, p in enumerate(pending):
+        anchor = p["res"]["anchor_avg"]
+        for m in p["cands"]:
+            pairs.append((abs(m["avg_rssi"] - anchor), i, m))
+    pairs.sort(key=lambda t: (t[0], pending[t[1]]["seed"]["label"]))
+    claimed_by = {}  # candidate mac -> {"label": ..., "delta": ...}
+    assigned = {}    # pending index -> candidate mac
+    for delta, i, m in pairs:
+        if i in assigned or m["mac"] in claimed_by:
+            continue
+        assigned[i] = m["mac"]
+        claimed_by[m["mac"]] = {"label": pending[i]["seed"]["label"],
+                                "delta": delta}
+
+    for i, p in enumerate(pending):
+        row, res = p["row"], p["res"]
+        age = res["age_s"]
+        anchor_avg = res["anchor_avg"]
+        mac = assigned.get(i)
+        if mac is None:
+            if p["cands"]:
+                # Fresh level-matched devices exist, but every one was claimed
+                # by a better-fitting seed — one device cannot answer two
+                # identities. Honest UNRESOLVED, not a borrowed answer.
+                best = p["cands"][0]
+                claim = claimed_by[best["mac"]]
+                row["state"] = "UNRESOLVED"
+                row["detail"] = (f"slot ended {age/3600:.1f}h ago; the strong "
+                                 f"owner-shaped device at this level ({best['mac']} "
+                                 f"@ {best['avg_rssi']:.1f} dB) is claimed by "
+                                 f"{claim['label']} (Δ{claim['delta']:.1f}) — one "
+                                 f"device cannot answer two identities; awaiting "
                                  f"WiFi-join confirmation")
             else:
                 row["state"] = "STALE"
                 row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac'][:8]}…, "
                                  f"level {row['anchor_avg']})")
+            out.append(row)
+            continue
+        m = macs[mac]
+        ld = _parse_ts(m["last_ts"])
+        cd = (now - ld).total_seconds() if ld else present_s + 1
+        row["candidate"] = (f"{m['mac']} @ {m['avg_rssi']:.1f} dB "
+                            f"(Δ{abs(m['avg_rssi']-anchor_avg):.1f}) "
+                            f"co={m['company_id'] or '-'} last {int(cd)}s ago "
+                            f"— owner-shaped, unbound")
+        row["state"] = "PROBABLE"
+        row["detail"] = (f"slot ended {age/3600:.1f}h ago, but an owner-shaped "
+                         f"device is ACTIVE now ({int(cd)}s ago @ {m['avg_rssi']:.1f} "
+                         f"dB, slot level {row['anchor_avg']}) — awaiting "
+                         f"WiFi-join confirmation")
+        # Level-coincidence honesty: another seed's ASSIGNED candidate at the
+        # same level = the dual-radio phone signature (one object, two
+        # parallel streams) or two co-located objects — BLE alone cannot tell
+        # which is which. Say so instead of pretending the split is certain.
+        for j, q in enumerate(pending):
+            if j == i:
+                continue
+            om = macs.get(assigned.get(j, ""))
+            if om is None:
+                continue
+            if abs(om["avg_rssi"] - m["avg_rssi"]) <= level_gate:
+                row["candidate_note"] = (
+                    f"level-coincident with {q['seed']['label']}'s candidate "
+                    f"{om['mac'][:8]}… @ {om['avg_rssi']:.1f} dB — a dual-radio "
+                    f"phone or two co-located devices; identities not separable "
+                    f"by BLE alone (WiFi-join will split them)")
+                break
         out.append(row)
     if report:
         print_owner_view(out)
@@ -558,9 +617,13 @@ def print_owner_view(out):
         print(f"  {r['label']:<24} {r['state']:<10} {r['detail']}")
         if r.get("candidate"):
             print(f"{'':<24} {'':<10} └ candidate: {r['candidate']}")
+        if r.get("candidate_note"):
+            print(f"{'':<24} {'':<10} └ note: {r['candidate_note']}")
     print("  PRESENT = slot active ≤ 10min · PROBABLE = slot stale but a strong "
           "owner-shaped device is ACTIVE at seed level now (unbound until "
-          "WiFi-join confirmation) · STALE = no owner-shaped evidence in window")
+          "WiFi-join confirmation) · STALE = no owner-shaped evidence in window · "
+          "UNRESOLVED = the only level-matched device is already claimed by "
+          "another seed — one device never answers for two identities")
 
 
 def channel_health(c, report=True):
