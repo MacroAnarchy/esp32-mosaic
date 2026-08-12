@@ -423,6 +423,40 @@ def print_entity_view(rows, limit=40):
 # rebind path) is confirmation. STALE only when no fresh owner-shaped
 # candidate exists.
 
+def _seed_slot(slot_of, macs, mac):
+    """Resolve a seed MAC through rotation chains → its slot's current occupant.
+
+    Shared by owner_view (M1) and where_view (device lookup): a seed may be
+    an old rotating MAC whose slot is now occupied by a newer MAC at the
+    same signal level (the physical object did NOT move when its MAC
+    rotated — the level anchor says so). Returns
+    {active_mac, active_avg, anchor_avg, slot_n, age_s} with age_s = seconds
+    since the slot's latest occupant was last sighted, or None when the seed
+    was never sighted or its timestamps are unparseable. anchor_avg is
+    unrounded — callers round for display.
+    """
+    info = macs.get(mac)
+    if info is None:
+        return None
+    slot = slot_of.get(mac)
+    if slot:
+        mem = [macs[m] for m in slot if m in macs]
+        mem.sort(key=lambda m: m["first_ts"])
+        anchor_avg = sum(m["avg_rssi"] for m in mem) / len(mem)
+        active = max(mem, key=lambda m: m["last_ts"])
+        slot_n = len(slot)
+    else:
+        anchor_avg = info["avg_rssi"]
+        active = info
+        slot_n = 1
+    last_dt = _parse_ts(active["last_ts"])
+    if last_dt is None:
+        return None
+    age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    return {"active_mac": active["mac"], "active_avg": active["avg_rssi"],
+            "anchor_avg": anchor_avg, "slot_n": slot_n, "age_s": age}
+
+
 def owner_view(c, hours=24, report=True):
     """M1 resolver: owner presence through entity chains."""
     ensure_schema(c)
@@ -450,40 +484,26 @@ def owner_view(c, hours=24, report=True):
     for s in seeds:
         mac = s["mac"]
         row = {"label": s["label"], "seed": mac}
-        info = macs.get(mac)
-        if info is None:
+        if macs.get(mac) is None:
             row["state"] = "UNSEEN"
             row["detail"] = ("never sighted by the BLE sniffer (WiFi-only identity — "
                              "resolve via WiFi-join correlation)")
             out.append(row)
             continue
         slot = slot_of.get(mac)
-        # Level anchor: the slot's mean level, or the seed's own mean when
-        # the seed never joined a chain (isolated legacy MAC).
-        if slot:
-            mem = [macs[m] for m in slot if m in macs]
-            mem.sort(key=lambda m: m["first_ts"])
-            anchor_avg = sum(m["avg_rssi"] for m in mem) / len(mem)
-            active = max(mem, key=lambda m: m["last_ts"])
-            last_dt = _parse_ts(active["last_ts"])
-            row["slot_n"] = len(slot)
-            row["anchor_avg"] = round(anchor_avg, 1)
-            row["active_mac"] = active["mac"]
-            row["active_avg"] = active["avg_rssi"]
-        else:
-            anchor_avg = info["avg_rssi"]
-            last_dt = _parse_ts(info["last_ts"])
-            row["slot_n"] = 1
-            row["anchor_avg"] = round(anchor_avg, 1)
-            row["active_mac"] = mac
-            row["active_avg"] = info["avg_rssi"]
-        if last_dt is None:
+        res = _seed_slot(slot_of, macs, mac)
+        if res is None:
             row["state"] = "UNRESOLVED"
             row["detail"] = "unparseable timestamps — cannot resolve"
             out.append(row)
             continue
-        age = (now - last_dt).total_seconds()
-        row["age_s"] = age
+        row["slot_n"] = res["slot_n"]
+        row["anchor_avg"] = round(res["anchor_avg"], 1)
+        row["active_mac"] = res["active_mac"]
+        row["active_avg"] = res["active_avg"]
+        row["age_s"] = res["age_s"]
+        age = res["age_s"]
+        anchor_avg = res["anchor_avg"]
         if age <= present_s:
             row["state"] = "PRESENT"
             row["detail"] = (f"slot active {int(age)}s ago via {row['active_mac']} "
@@ -1089,6 +1109,17 @@ def tier_of(avg):
     return "EDGE"
 
 
+def zone_of(avg):
+    """Average RSSI → the README zone model (Z1 apartment / Z2 hallway /
+    Z3 deep bleed). Same boundaries as tier_of — the zone is the
+    operator-facing name of the tier."""
+    if avg >= -70:
+        return "Z1 apartment"
+    if avg >= -85:
+        return "Z2 hallway"
+    return "Z3 deep bleed"
+
+
 def analyze_handoffs(c, hours=24, report=True, return_macs=False):
     """Three-layer handoff analysis (data association in RSSI space).
 
@@ -1411,24 +1442,132 @@ def backfill_beacons(c):
     print(f"backfilled {n} beacon samples from {len(rows)} wifi envelopes.")
 
 
+def _where_chain_path(d, macs, slot_of):
+    """Chain-trace branch of where_view: the seed has no fresh sightings.
+
+    Resolve the seed through rotation chains to its slot's CURRENT occupant
+    (the physical object did not move when its MAC rotated — the level
+    anchor says so), then, when the slot itself is stale, surface a live
+    level-matched STRONG device at the slot's level — same evidence rule as
+    owner_view's candidate (never auto-bound: labels are earned). Its zone
+    IS the answer to 'where is it right now'.
+    """
+    res = _seed_slot(slot_of, macs, d["mac"])
+    if res is None:
+        print(f"  {d['label']:<24} UNSEEN — seed {d['mac']} never sighted "
+              "by the BLE sniffer (WiFi-only identity?)")
+        return
+    zone = zone_of(res["active_avg"])
+    rotated = "" if res["active_mac"] == d["mac"] else \
+        f" (slot rotated from {d['mac']})"
+    present_s = WM.get("owner_present_seconds", 600)
+    if res["age_s"] <= present_s:
+        verdict = f"PRESENT — active {int(res['age_s'])}s ago"
+    else:
+        verdict = f"slot ended {res['age_s']/3600:.1f}h ago"
+    print(f"  {d['label']:<24} {verdict} — {res['active_mac']} @ "
+          f"{res['active_avg']:.1f} dB, zone {zone}, slot {res['slot_n']} "
+          f"MACs level {res['anchor_avg']:.1f}{rotated}")
+    if res["age_s"] <= present_s:
+        return
+    level_gate = WM.get("stream_level_gate", 4)
+    now = datetime.now(timezone.utc)
+    cands = []
+    for m in macs.values():
+        if m["mac"] in (slot_of.get(d["mac"]) or [d["mac"]]):
+            continue
+        if tier_of(m["avg_rssi"]) != "STRONG":
+            continue
+        if abs(m["avg_rssi"] - res["anchor_avg"]) > level_gate:
+            continue
+        cd = _parse_ts(m["last_ts"])
+        if cd is None or (now - cd).total_seconds() > present_s:
+            continue
+        cands.append(m)
+    cands.sort(key=lambda m: abs(m["avg_rssi"] - res["anchor_avg"]))
+    if cands:
+        m = cands[0]
+        cd = (now - _parse_ts(m["last_ts"])).total_seconds()
+        print(f"  {'':<24} └ live: {m['mac']} @ {m['avg_rssi']:.1f} dB "
+              f"(Δ{abs(m['avg_rssi']-res['anchor_avg']):.1f}) "
+              f"zone {zone_of(m['avg_rssi'])} last {int(cd)}s ago "
+              f"— level-matched, unbound")
+
+
 def where_view(c, label):
-    """mosaic_where: resolve a place label → BSSIDs → current signal picture."""
+    """mosaic_where: resolve a label to its current location picture.
+
+    DEVICE labels (devices table) resolve FIRST — 'where is my phone' is
+    the killer question. A seeded MAC may be an old rotating identity, so
+    a seed with no fresh sightings is traced through entity chains to its
+    slot's CURRENT occupant (same machinery as owner_view). Falls back to
+    PLACE labels (locations.json → BSSIDs → beacon picture). Unknown
+    labels list what IS known, so the operator sees the vocabulary.
+    """
     ensure_schema(c)
+    devs = [dict(r) for r in c.execute(
+        "SELECT mac, label, note, stable FROM devices WHERE lower(label) = lower(?)",
+        (label,))]
+    if devs:
+        # Quick path: the seed itself was seen in the last 24h → answer
+        # without the (costly) chain pass. Only stale seeds need chains.
+        w_start = (datetime.now(timezone.utc) -
+                   timedelta(hours=24)).isoformat(timespec="seconds").replace("T", " ")
+        quick = {}
+        for d in devs:
+            r = c.execute(
+                """SELECT COUNT(*) n, MIN(rssi) mn, MAX(rssi) mx,
+                          ROUND(AVG(rssi),1) avg, MAX(received_at) last_seen
+                   FROM sightings
+                   WHERE mac=? AND REPLACE(substr(received_at,1,19),'T',' ') > ?""",
+                (d["mac"], w_start)).fetchone()
+            quick[d["mac"]] = dict(r) if r and r["n"] else None
+        macs = slot_of = None
+        if any(q is None for q in quick.values()):
+            rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
+            chains = collapse_chains(rows, macs)
+            slot_of = {}
+            for ch in chains:
+                for m in ch:
+                    slot_of[m] = ch
+        print(f"\nDEVICE '{label}' — resolved through entity chains (168h):")
+        print("-" * 78)
+        for d in devs:
+            q = quick[d["mac"]]
+            if q is not None:
+                print(f"  {d['label']:<24} last seen {q['last_seen']} — "
+                      f"n={q['n']} avg {q['avg']} dB ({q['mn']}..{q['mx']}), "
+                      f"zone {zone_of(q['avg'])}")
+            elif macs is None or slot_of is None:
+                print(f"  {d['label']:<24} UNSEEN — seed {d['mac']} never sighted "
+                      "by the BLE sniffer (WiFi-only identity?)")
+            else:
+                _where_chain_path(d, macs, slot_of)
+        return
+    # Place fallback: label → BSSIDs → current beacon picture (original path).
     locations = load_locations()
     bssids = [b for b, info in locations.items()
               if isinstance(info, dict) and info.get("label") == label]
-    if not bssids:
-        print(f"No location label '{label}' in {LOCATIONS_FILE}.")
+    if bssids:
+        for bssid in bssids:
+            r = c.execute("SELECT * FROM places WHERE bssid=?", (bssid,)).fetchone()
+            if not r:
+                print(f"  {bssid} ({label}): no beacon sightings yet")
+                continue
+            print(f"  {bssid} ({label}) — ssid={r['ssid']} ch={r['channel']} "
+                  f"seen={r['seen_count']} rssi={r['min_rssi']}..{r['max_rssi']} "
+                  f"avg={r['avg_rssi']:.1f} last={r['last_seen']} "
+                  f"{'PLACE' if r['stable'] else 'not-yet-place'}")
         return
-    for bssid in bssids:
-        r = c.execute("SELECT * FROM places WHERE bssid=?", (bssid,)).fetchone()
-        if not r:
-            print(f"  {bssid} ({label}): no beacon sightings yet")
-            continue
-        print(f"  {bssid} ({label}) — ssid={r['ssid']} ch={r['channel']} "
-              f"seen={r['seen_count']} rssi={r['min_rssi']}..{r['max_rssi']} "
-              f"avg={r['avg_rssi']} last={r['last_seen']} "
-              f"{'PLACE' if r['stable'] else 'not-yet-place'}")
+    known_devs = [r["label"] for r in c.execute(
+        "SELECT DISTINCT label FROM devices WHERE label IS NOT NULL ORDER BY label")]
+    known_places = sorted({lbl for info in locations.values()
+                           if isinstance(info, dict) and (lbl := info.get("label"))})
+    print(f"No label '{label}' in the devices table or {LOCATIONS_FILE}.")
+    if known_devs:
+        print(f"  Known device labels: {', '.join(known_devs)}")
+    if known_places:
+        print(f"  Known place labels:  {', '.join(known_places)}")
 
 
 def main():
@@ -1449,7 +1588,9 @@ def main():
                     help="sensing pipeline heartbeat — per-channel + per-node liveness")
     ap.add_argument("--backfill-beacons", action="store_true",
                     help="rebuild beacon_samples from events JSON history")
-    ap.add_argument("--where", metavar="LABEL", help="resolve a place label via BSSIDs")
+    ap.add_argument("--where", metavar="LABEL",
+                    help="resolve a device label (devices table → entity chain slots) "
+                         "or place label (locations.json → BSSIDs)")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
 
