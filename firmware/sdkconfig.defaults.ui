@@ -1,0 +1,19 @@
+# Mosaic UI env — sdkconfig defaults (applied on every clean build, so the
+# PSRAM config can never drift out again).
+#
+# The CO5300 AMOLED glow canvas needs a 434KB framebuffer → PSRAM is
+# MANDATORY. The Waveshare S3 board has OCTAL PSRAM (64Mbit) on GPIO 30/26:
+#   CONFIG_SPIRAM=y
+#   CONFIG_SPIRAM_MODE_OCT=y        ← CRITICAL: quad mode fails to init
+#   CONFIG_SPIRAM_CLK_IO=30
+#   CONFIG_SPIRAM_CS_IO=26
+#   CONFIG_SPIRAM_SPEED_80M=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_CLK_IO=30
+CONFIG_SPIRAM_CS_IO=26
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
