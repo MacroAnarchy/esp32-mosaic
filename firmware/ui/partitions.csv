@@ -1,0 +1,11 @@
+# UI node partition table — two OTA app slots (A/B), 8MB total usable.
+# The UI env (ESP32-S3, 16MB flash) needs ota_0 + ota_1 for wireless
+# firmware updates.
+# Note: app partitions must be 0x10000-aligned; otadata ends at 0x11000,
+# so ota_0 starts at 0x20000 (the next aligned boundary).
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+ota_0,    0,    ota_0,   0x20000,  0x3E0000,
+ota_1,    0,    ota_1,   0x400000, 0x3E0000,
+coredump, data, coredump,0x7F0000, 0x10000,

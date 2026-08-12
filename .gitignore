@@ -11,6 +11,9 @@ __pycache__/
 # PlatformIO build artifacts
 firmware/.pio/
 
+# ESP-IDF component manager downloads (pinned by firmware/dependencies.lock)
+firmware/managed_components/
+
 # Local data
 *.db
 *.jsonl
