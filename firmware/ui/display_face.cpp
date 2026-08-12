@@ -416,13 +416,17 @@ esp_err_t display_face_init(void)
         /* continue: state machine still runs, flush is a no-op */
     }
 
-    /* Persistent DMA band — one 59KB internal-RAM block, allocated ONCE.
-     * Without it the SPI driver allocates a priv TX buffer per band
-     * transaction and internal RAM fragments until a frame dies. */
+    /* Persistent DMA band — one 59KB block, allocated ONCE in internal
+     * DMA-capable RAM. The esp_lcd SPI io does NOT set
+     * SPI_TRANS_DMA_USE_PSRAM, so a PSRAM band would be copied into
+     * internal RAM per transaction anyway (and that alloc fails when
+     * WiFi is active). Internal band = zero priv-TX allocation ever.
+     * WiFi TX buffers are dynamic (see sdkconfig.defaults.ui) so this
+     * 59KB stays affordable. */
     if (s_dmaBand == NULL) {
         s_dmaBand = (uint16_t *)heap_caps_malloc(
             (size_t)kBandRows * kScreenW * sizeof(uint16_t),
-            MALLOC_CAP_DMA);
+            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (s_dmaBand == NULL) {
             ESP_LOGE(TAG, "DMA band alloc failed — display will freeze");
         } else {
