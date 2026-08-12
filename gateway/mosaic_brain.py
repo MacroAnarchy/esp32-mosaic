@@ -15,7 +15,8 @@ Turns the raw sighting stream into ENTITIES:
 
 Usage:
   python3 mosaic_brain.py --status          # entity view of recent data
-  python3 mosaic_brain.py --devices         # device table
+  python3 mosaic_brain.py --devices         # known-device inventory (labeled + named)
+  python3 mosaic_brain.py --seeds           # dump the devices table (identity seeds)
   python3 mosaic_brain.py --seed-labels     # import device labels JSON
   python3 mosaic_brain.py --chains          # class-weighted entity chains
   python3 mosaic_brain.py --places          # BSSID registry → PLACE entities
@@ -424,6 +425,147 @@ def print_entity_view(rows, limit=40):
     counts = {t: sum(1 for r in rows if r["tier"] == i) for i, t in enumerate(tiers)}
     summary = " · ".join(f"{t}={counts[t]}" for t in tiers)
     print(f"  {summary}  (of {len(rows)} devices; spr = robust p10-p90 spread, raw = max-min)")
+
+
+def _movement_class(spread):
+    """Movement class from the robust p10-p90 spread (entity_view vocabulary)."""
+    if spread <= STATIONARY_MAX_SPREAD:
+        return "STATIC"
+    if spread >= MOVING_MIN_SPREAD:
+        return "MOVING"
+    return "AMBI"
+
+
+def devices_view(c, hours=24):
+    """KNOWN-device inventory: every device with an EARNED identity.
+
+    Earned = explicit label in the devices table (seeds/manual annotations)
+    OR a device-reported broadcast name (TV/ThermoBeacon/earbuds/...).
+    findmy-* auto labels are placeholders, not names — rotating AirTag MACs
+    stay out of the inventory until someone names the underlying object
+    (same rule as entity_view's KNOWN tier).
+
+    Each row: mac, label, dclass, window movement class, window avg/n,
+    all-time last_seen, entity chain id (E-rank, same order as --chains),
+    stable flag, seed flag. Window stats come from device_stats (needs >=3
+    window sightings); seeds with zero sightings ever report UNSEEN, seeds
+    last sighted outside the window report STALE (slot vocabulary of
+    --owner). Entity ids come from the SAME full-history chain pass the
+    owner/where resolvers use (168h) — a seed's entity = the slot chain its
+    rotating MAC belongs to, so identity anchors link to live entities
+    instead of dead seed MACs.
+    """
+    ensure_schema(c)
+    labels = {r["mac"]: r for r in c.execute("SELECT * FROM devices")}
+    stats = {r["mac"]: r for r in device_stats(c, hours)}
+
+    # Device-reported names: the LATEST broadcast name per MAC (non-findmy
+    # classes — a findmy name is not an earned label, see entity_view).
+    named = {}
+    for r in c.execute("""
+        SELECT mac, name, device_class
+        FROM sightings s
+        WHERE name IS NOT NULL AND trim(name) != ''
+          AND COALESCE(device_class, '') != 'findmy'
+          AND id IN (SELECT MAX(id) FROM sightings
+                     WHERE name IS NOT NULL AND trim(name) != ''
+                     GROUP BY mac)
+    """):
+        named[r["mac"]] = dict(r)
+
+    known_macs = sorted(set(labels) | set(named))
+
+    # All-time last sighting per known MAC (one indexed pass).
+    last_seen = {}
+    if known_macs:
+        q = ",".join("?" * len(known_macs))
+        for r in c.execute(
+            f"SELECT mac, MAX(received_at) AS last_seen FROM sightings "
+            f"WHERE mac IN ({q}) GROUP BY mac", known_macs):
+            last_seen[r["mac"]] = r["last_seen"]
+
+    # Entity membership: full-history chain pass (168h — the same basis as
+    # --owner/--where resolution), ranked by size like the --chains print
+    # order (largest = E1). Best-effort — the inventory must not die
+    # because the chain pass failed.
+    chain_of = {}
+    try:
+        rows, macs_full = analyze_handoffs(c, 24 * 7, report=False,
+                                           return_macs=True)
+        for i, chain in enumerate(
+                sorted(collapse_chains(rows, macs_full), key=len,
+                       reverse=True), 1):
+            for m in chain:
+                chain_of.setdefault(m, f"E{i}")
+    except Exception:
+        pass
+
+    out = []
+    for mac in known_macs:
+        lbl = labels.get(mac)
+        nm = named.get(mac)
+        st = stats.get(mac)
+        seed = bool(lbl)
+        label = (lbl["label"] if lbl and lbl["label"]
+                 else (nm["name"] if nm else None)) or mac
+        if st:
+            cls = _movement_class(st["spread"])
+            avg, n = st["avg_rssi"], st["n"]
+        elif seed:
+            # Labeled identity: UNSEEN = zero BLE sightings ever (honest
+            # WiFi-only anchor); STALE = sighted historically, outside the
+            # window (its MAC rotated on — the slot took over, see entity).
+            cls = "UNSEEN" if not last_seen.get(mac) else "STALE"
+            avg, n = None, None
+        else:
+            cls, avg, n = "-", None, None
+        dclass = (st or {}).get("device_class") or (nm or {}).get("device_class") or "-"
+        out.append({
+            "mac": mac, "label": label, "dclass": dclass, "class": cls,
+            "avg": avg, "n": n, "last_seen": last_seen.get(mac),
+            "entity": chain_of.get(mac, "-"),
+            "stable": bool(lbl and lbl["stable"]), "seed": seed,
+        })
+    out.sort(key=lambda r: (0 if r["stable"] else 1, r["label"].lower()))
+    return out
+
+
+def print_devices_view(rows, hours=24):
+    """Render the known-device inventory."""
+    if not rows:
+        print("No known devices (empty devices table and no named broadcasts).")
+        return
+    print(f"\nKNOWN DEVICES ({len(rows)} — labeled seeds + device-reported names, "
+          f"{hours}h window):")
+    print(f"{'LABEL':<24} {'cls':<7} {'dclass':<9} {'avg':>5} {'n':>4} "
+          f"{'last_seen':<23} {'entity':<7}  mac")
+    print("-" * 112)
+    for r in rows:
+        stable_m = "*" if r["stable"] else " "
+        avg = f"{r['avg']:>5.1f}" if r["avg"] is not None else "    -"
+        n = f"{r['n']:>4}" if r["n"] is not None else "   -"
+        last = r["last_seen"] or "-"
+        print(f"{stable_m}{r['label'][:23]:<23} {r['class']:<7} {r['dclass']:<9} "
+              f"{avg} {n} {last:<23} {r['entity']:<7}  {r['mac']}")
+    seeds = sum(1 for r in rows if r["seed"])
+    unseen = sum(1 for r in rows if r["class"] == "UNSEEN")
+    stale = sum(1 for r in rows if r["class"] == "STALE")
+    print(f"  {len(rows)} known: {seeds} labeled seeds "
+          f"({stale} STALE — outside window, {unseen} never sighted by BLE), "
+          f"{len(rows) - seeds} name-reported; "
+          f"entity = chain slot id (168h pass, see --chains, largest = E1)")
+
+
+def print_seeds(c):
+    """The devices-table dump (identity anchors). Formerly --devices."""
+    rows = c.execute("SELECT mac, label, stable FROM devices "
+                     "ORDER BY stable DESC, label").fetchall()
+    print("SEEDS (devices table — labeled identity anchors; * = stable/WiFi):")
+    for r in rows:
+        print(f"{'*' if r['stable'] else ' '} {r['mac']}  {r['label']}")
+    if not rows:
+        print("  (empty — run --seed-labels to import device labels JSON)")
+
 
 
 # --- OWNER PRESENCE (M1) ----------------------------------------------------
@@ -1947,7 +2089,10 @@ def where_view(c, label):
 def main():
     ap = argparse.ArgumentParser(description="ESP32-Mosaic world-model brain")
     ap.add_argument("--status", action="store_true", help="entity view of recent data")
-    ap.add_argument("--devices", action="store_true", help="list device table")
+    ap.add_argument("--devices", action="store_true",
+                    help="known-device inventory (labeled seeds + device-reported names)")
+    ap.add_argument("--seeds", action="store_true",
+                    help="dump the devices table (identity seed labels)")
     ap.add_argument("--seed-labels", action="store_true", help="import device labels JSON")
     ap.add_argument("--bind-slots", action="store_true", help="three-layer handoff analysis")
     ap.add_argument("--handoffs", action="store_true", help="alias for --bind-slots")
@@ -1974,8 +2119,9 @@ def main():
     if args.seed_labels:
         seed_labels(c)
     if args.devices:
-        for r in c.execute("SELECT mac, label, stable FROM devices ORDER BY stable DESC"):
-            print(f"{'*' if r['stable'] else ' '} {r['mac']}  {r['label']}")
+        print_devices_view(devices_view(c, args.hours), args.hours)
+    if args.seeds:
+        print_seeds(c)
     if args.status:
         channel_health(c)              # pipeline health gate FIRST — readings
         owner_view(c, args.hours)      # are only as good as the channels
@@ -1998,7 +2144,8 @@ def main():
         backfill_beacons(c)
     if args.where:
         where_view(c, args.where)
-    if not (args.status or args.devices or args.seed_labels or args.bind_slots
+    if not (args.status or args.devices or args.seeds or args.seed_labels
+            or args.bind_slots
             or args.handoffs or args.chains or args.lockstep or args.places
             or args.probes or args.owner or args.channels or args.backfill_beacons
             or args.where):
