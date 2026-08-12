@@ -3,12 +3,15 @@
  *
  * Unified firmware: the BLE sense engine (components/sense) runs in its
  * own task while this main owns the display face (CO5300 AMOLED + glow
- * engine, firmware/ui/display_face.cpp) and cycles face states so the
- * panel visibly works.
+ * engine, firmware/ui/display_face.cpp). The face's default live view is
+ * THE RADIO DOME: the local BLE device table rendered as a living
+ * aurora dome — center = this node, rings = RSSI zones, orbs = sensed
+ * devices (onboard data only, no gateway).
  *
- * Roadmap: replace the demo cycle with sense-engine → face-state mapping
- * (owner in range → FACE_OWNER_NEAR, brain WS face_state commands, ...).
- * sense_engine_get_device_count() is the integration seam.
+ * The existing face state system (face_set_state) stays intact — states
+ * tint/boost the dome (amber wisps, voice ring, alert sweep, sleep dim)
+ * and future brain/WS face_state commands can drive it from here.
+ * sense_engine_get_device_count() remains the integration seam for logs.
  */
 
 #include <stdio.h>
@@ -32,7 +35,7 @@ void app_main(void)
         return;
     }
     display_face_start_render_task();
-    ESP_LOGI(TAG, "face initialized — IDLE");
+    ESP_LOGI(TAG, "face initialized — radio dome live (IDLE)");
 
     /* Sense engine: NVS + NimBLE host + WiFi, then its own task. */
     ret = sense_engine_init();
@@ -43,19 +46,13 @@ void app_main(void)
         ESP_LOGI(TAG, "sense engine started (BLE scan -> gateway)");
     }
 
-    /* Demo cycle: prove every state renders. */
-    const face_state_t cycle[] = {
-        FACE_IDLE, FACE_OWNER_NEAR, FACE_VOICE,
-        FACE_ALERT, FACE_SLEEP, FACE_IDLE,
-    };
-    const int n = sizeof(cycle) / sizeof(cycle[0]);
-    int i = 0;
+    /* The dome is the default live view: calm idle when the ether is
+     * empty, orbs + streams appear as the node's senses wake up. */
+    display_face_set_state(FACE_IDLE);
 
     while (1) {
-        display_face_set_state(cycle[i]);
-        ESP_LOGI(TAG, "face state -> %d (last BLE scan saw %d devices)",
-                 (int)cycle[i], sense_engine_get_device_count());
-        i = (i + 1) % n;
-        vTaskDelay(pdMS_TO_TICKS(4000));
+        ESP_LOGI(TAG, "radio dome: last scan saw %d device(s)",
+                 sense_engine_get_device_count());
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }

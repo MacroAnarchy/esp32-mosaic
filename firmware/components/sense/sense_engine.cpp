@@ -158,6 +158,11 @@ static volatile bool g_ble_synced = false;
 static volatile bool g_scan_done = false;
 static uint8_t g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 
+// Guards the device table: written by the NimBLE host task (scan
+// callbacks) + the sense task (window reset), read by the UI render
+// task via sense_engine_get_devices(). Short critical sections only.
+static portMUX_TYPE s_records_lock = portMUX_INITIALIZER_UNLOCKED;
+
 static bool inUint16Table(uint16_t v, const uint16_t *table, size_t n) {
   for (size_t i = 0; i < n; i++)
     if (v == table[i]) return true;
@@ -287,15 +292,18 @@ static int bleScanCallback(struct ble_gap_event *event, void *arg) {
 #endif  // MOSAIC_BLE_ENABLE_CLASSIFY
 
       // Dedup by MAC within the window (controller filter is the primary guard)
+      portENTER_CRITICAL(&s_records_lock);
       for (uint8_t i = 0; i < g_recordCount; i++) {
         if (strcmp(g_records[i].mac, rec.mac) == 0) {
           g_records[i].rssi = rec.rssi;  // refresh signal strength
+          portEXIT_CRITICAL(&s_records_lock);
           return 0;
         }
       }
       uint8_t idx = g_recordCount;
       g_records[idx] = rec;
       g_recordCount = idx + 1;
+      portEXIT_CRITICAL(&s_records_lock);
       break;
     }
     case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -638,7 +646,35 @@ bool sense_wifi_get_ipv4(uint8_t ip[4], uint8_t mask[4]) {
   return true;
 }
 
-int sense_engine_get_device_count(void) { return (int)g_recordCount; }
+int sense_engine_get_device_count(void)
+{
+  int n;
+  portENTER_CRITICAL(&s_records_lock);
+  n = (int)g_recordCount;
+  portEXIT_CRITICAL(&s_records_lock);
+  return n;
+}
+
+int sense_engine_get_devices(sense_device_t *out, int max_records)
+{
+  if (out == NULL || max_records <= 0) return 0;
+  portENTER_CRITICAL(&s_records_lock);
+  int n = (int)g_recordCount;
+  if (n > max_records) n = max_records;
+  for (int i = 0; i < n; i++) {
+    strncpy(out[i].mac, g_records[i].mac, sizeof(out[i].mac) - 1);
+    out[i].mac[sizeof(out[i].mac) - 1] = '\0';
+    out[i].rssi = g_records[i].rssi;
+    strncpy(out[i].deviceClass, g_records[i].deviceClass,
+            sizeof(out[i].deviceClass) - 1);
+    out[i].deviceClass[sizeof(out[i].deviceClass) - 1] = '\0';
+    out[i].haveName = g_records[i].haveName;
+    strncpy(out[i].name, g_records[i].name, sizeof(out[i].name) - 1);
+    out[i].name[sizeof(out[i].name) - 1] = '\0';
+  }
+  portEXIT_CRITICAL(&s_records_lock);
+  return n;
+}
 
 // =====================================================================
 // Sense task — the loop the Arduino build ran in loop(), now a FreeRTOS
@@ -683,7 +719,9 @@ static void senseTask(void *arg) {
 #endif  // MOSAIC_CSI_ENABLE
     // Scan for 5 seconds (callbacks fill g_records meanwhile)
     ESP_LOGI(TAG, "--- BLE scan (5s) ---");
+    portENTER_CRITICAL(&s_records_lock);
     g_recordCount = 0;
+    portEXIT_CRITICAL(&s_records_lock);
     g_scan_done = false;
     if (g_ble_synced) {
       struct ble_gap_disc_params dp;
