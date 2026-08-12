@@ -26,6 +26,10 @@
 // Local config (gitignored — copy from include/config.example.h)
 #include "config.h"
 
+// ARP neighbor discovery — normal WiFi client behavior: periodically probe
+// the subnet, track MAC→IP pairs, report join/leave events to the gateway.
+#include "arp_neighbors.h"
+
 // ---- Feature flags (defaults ON — override in config.h) ----
 #ifndef MOSAIC_BLE_ENABLE_AD_PARSING
 #define MOSAIC_BLE_ENABLE_AD_PARSING 1
@@ -541,6 +545,13 @@ void loop() {
     }
   }
 #endif  // MOSAIC_WIFI_SCAN_ENABLE
+
+#if MOSAIC_ARP_ENABLE
+  // ARP neighbor discovery — the node is an ordinary WiFi station, so it
+  // probes its subnet like any other host (normal network membership).
+  // Runs only while associated; reports join/leave as protocol envelopes.
+  arpNeighborsLoop();
+#endif  // MOSAIC_ARP_ENABLE
 
   // Pause between scans (configurable; default 15s per config.example.h)
   delay(MOSAIC_SCAN_INTERVAL);

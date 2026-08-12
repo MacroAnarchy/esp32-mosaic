@@ -60,3 +60,36 @@
 
 // Time (ms) spent listening on each channel. 13 channels x 80ms ≈ 1s sweep.
 #define MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS 80
+
+// --- ARP neighbor discovery (default ON) ---
+// Normal network membership behavior: the node is an ordinary WiFi client,
+// so it periodically ARP-probes its own subnet (every station does this),
+// learns which MAC/IP pairs are alive, and reports WiFi join/leave events to
+// the gateway as type:"arp_join" / type:"arp_leave" envelopes. The brain can
+// use join events to confirm entity presence (a MAC with a live IP is
+// stronger evidence than a radio sighting alone). On APs with client
+// isolation the sweep simply finds no neighbors — no events, no errors.
+// See docs/protocol.md ("arp_join" / "arp_leave").
+
+// Enable periodic ARP neighbor discovery (runs only while WiFi is up).
+#define MOSAIC_ARP_ENABLE 1
+
+// How often (seconds) the node probes the subnet.
+#define MOSAIC_ARP_INTERVAL_SECONDS 60
+
+// Time (ms) to wait for ARP replies per request batch.
+#define MOSAIC_ARP_RESPONSE_WINDOW_MS 250
+
+// Leave timeout: a MAC unseen for this many consecutive cycles emits an
+// arp_leave event (default 3 x 60s ≈ 3 min).
+#define MOSAIC_ARP_LEAVE_TIMEOUT_INTERVALS 3
+
+// Seen-table size cap (oldest entry evicted when full).
+#define MOSAIC_ARP_MAX_NEIGHBORS 32
+
+// Example scan subnet. The sweep derives the range from the node's live
+// IP + netmask at runtime; these values document the expected shape and
+// serve as the fallback when the live mask is unusual (see
+// firmware/src/arp_neighbors.h).
+#define MOSAIC_ARP_SCAN_NETWORK "192.168.1.0"
+#define MOSAIC_ARP_SCAN_MASK "255.255.255.0"
