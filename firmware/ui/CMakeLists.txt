@@ -11,7 +11,6 @@
 # through firmware/CMakeLists.txt's EXTRA_COMPONENT_DIRS.
 idf_component_register(
     SRCS "main_ui.c" "display_face.cpp" "fx/fx_glow.cpp"
-         "orb_pmu.cpp" "port_axp2101.cpp"
-    INCLUDE_DIRS "." "fx"
-    REQUIRES sense esp_lcd_co5300 esp_lcd driver esp_timer
+    INCLUDE_DIRS "."
+    REQUIRES sense esp_lcd_co5300 esp_lcd driver
 )

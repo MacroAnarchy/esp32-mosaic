@@ -272,23 +272,31 @@ static void vignette_apply(uint16_t *fb)
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 
+/* Persistent DMA-capable band buffer: the PSRAM canvas is not DMA-safe
+ * for the SPI controller, and allocating a private TX buffer per
+ * transaction fragments internal RAM until one 59KB alloc fails
+ * (frozen screen after ~6 min). One pre-allocated band = zero churn. */
+static uint16_t *s_dmaBand = NULL;
+static const int kBandRows = 64;
+
 static void mosaic_panel_flush(uint16_t *fb)
 {
-    if (s_panel == NULL) {
+    if (s_panel == NULL || s_dmaBand == NULL) {
         return;
     }
     /* Round cutout: soften the disc edge once per frame, in place. */
     vignette_apply(fb);
-    /* The full 466x466 frame (~434KB) exceeds internal DMA memory, so
-     * push it in 64-row bands — the CO5300 accepts partial y-ranges. */
-    const int band_rows = 64;
-    for (int y = 0; y < kScreenH; y += band_rows) {
-        int rows = band_rows;
+    /* Push 64-row bands through the persistent DMA buffer — the CO5300
+     * accepts partial y-ranges, and the copy is cheap (~59KB memcpy). */
+    for (int y = 0; y < kScreenH; y += kBandRows) {
+        int rows = kBandRows;
         if (y + rows > kScreenH) {
             rows = kScreenH - y;
         }
+        memcpy(s_dmaBand, fb + (size_t)y * kScreenW,
+               (size_t)rows * kScreenW * sizeof(uint16_t));
         esp_lcd_panel_draw_bitmap(s_panel, 0, y, kScreenW, y + rows,
-                                  fb + (size_t)y * kScreenW);
+                                  s_dmaBand);
     }
 }
 
@@ -401,6 +409,21 @@ esp_err_t display_face_init(void)
         ESP_LOGE(TAG, "panel init failed (%s) — face renders framebuffer only",
                  esp_err_to_name(ret));
         /* continue: state machine still runs, flush is a no-op */
+    }
+
+    /* Persistent DMA band — one 59KB internal-RAM block, allocated ONCE.
+     * Without it the SPI driver allocates a priv TX buffer per band
+     * transaction and internal RAM fragments until a frame dies. */
+    if (s_dmaBand == NULL) {
+        s_dmaBand = (uint16_t *)heap_caps_malloc(
+            (size_t)kBandRows * kScreenW * sizeof(uint16_t),
+            MALLOC_CAP_DMA);
+        if (s_dmaBand == NULL) {
+            ESP_LOGE(TAG, "DMA band alloc failed — display will freeze");
+        } else {
+            ESP_LOGI(TAG, "DMA band ready (%u bytes)",
+                     (unsigned)(kBandRows * kScreenW * sizeof(uint16_t)));
+        }
     }
 
     if (!s_canvas.init(nullptr, 0, flush_cb, nullptr)) {

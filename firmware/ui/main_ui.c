@@ -22,7 +22,6 @@
 
 #include "display_face.h"
 #include "sense_engine.h"
-#include "orb_pmu.h"
 
 static const char *TAG = "mosaic-ui";
 
@@ -37,17 +36,6 @@ void app_main(void)
     }
     display_face_start_render_task();
     ESP_LOGI(TAG, "face initialized — radio dome live (IDLE)");
-
-    /* Power: initialize the AXP2101 PMIC so the board stays alive on
-     * battery and the power key works. Without this the PMIC ROM
-     * defaults drop the rails (the "screen goes black" mystery). */
-    ret = orb_pmu_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "PMU init failed (%s) — board may power off on unplug",
-                 esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "PMU live — rails held, PEK active");
-    }
 
     /* Sense engine: NVS + NimBLE host + WiFi, then its own task. */
     ret = sense_engine_init();
