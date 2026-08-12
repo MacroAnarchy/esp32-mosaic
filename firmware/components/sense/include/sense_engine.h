@@ -37,6 +37,22 @@ esp_err_t sense_engine_init(void);
  * layer / logging). Thread-safe read. */
 int sense_engine_get_device_count(void);
 
+/* One device sighting snapshot for the UI layer (radio dome). The full
+ * device table is copied out so the face renderer can map each MAC to a
+ * stable dome position without touching the sense engine's internals. */
+typedef struct sense_device {
+    char mac[18];        /* "aa:bb:cc:dd:ee:ff" */
+    int8_t rssi;
+    char deviceClass[16];/* findmy | meta | flipper | unknown */
+    bool haveName;
+    char name[33];
+} sense_device_t;
+
+/* Copy the last completed scan window's device table into out[]
+ * (max_records entries max). Thread-safe, best-effort: returns the
+ * number of records copied. */
+int sense_engine_get_devices(sense_device_t *out, int max_records);
+
 /* True when the node currently has an IP lease (gateway reachable). */
 bool sense_wifi_is_connected(void);
 
