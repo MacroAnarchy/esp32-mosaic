@@ -374,7 +374,12 @@ static esp_err_t mosaic_panel_init(void)
         return ret;
     }
 
-    esp_lcd_panel_set_gap(s_panel, 0x06, 0);
+    /* CO5300 GRAM is taller than the visible 466×466 round area; the
+     * physical center sits 70 rows below the GRAM origin. Without the
+     * y-gap every implementation renders ~70px too high. The known-good
+     * value across the ecosystem is 70.
+     */
+    esp_lcd_panel_set_gap(s_panel, 0x06, 70);
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     esp_lcd_panel_disp_on_off(s_panel, true);
@@ -805,6 +810,25 @@ static void render_center(float gain)
                         0.26f + 0.14f * pulse, 12);
     s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 255, 255 },
                         0.55f + 0.25f * pulse, 3);
+
+    /* CALIBRATION OVERLAY — first 90 frames (~2.7s): center dot, crosshair,
+     * and the assumed visible-circle edge. Shows where the software thinks
+     * the panel center is, vs the physical glass. */
+    if (s_frame < 90) {
+        for (int a = 0; a < 360; a++) {
+            float ang = (float)a / 360.0f * 6.2831853f;
+            s_canvas.addGlowDot(kCenterX + cosf(ang) * 226.0f,
+                                kCenterY + sinf(ang) * 226.0f,
+                                { 255, 255, 255 }, 0.9f, 2);
+            s_canvas.addGlowDot(kCenterX + cosf(ang) * 113.0f,
+                                kCenterY + sinf(ang) * 113.0f,
+                                { 120, 200, 255 }, 0.5f, 2);
+        }
+        for (int d = -200; d <= 200; d += 20) {
+            s_canvas.addGlowDot(kCenterX + d, kCenterY, { 255, 255, 255 }, 0.7f, 2);
+            s_canvas.addGlowDot(kCenterX, kCenterY + d, { 255, 255, 255 }, 0.7f, 2);
+        }
+    }
 }
 
 /* The orbs: one per device, MAC-stable angle, RSSI-driven radius,
