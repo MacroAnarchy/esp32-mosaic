@@ -942,37 +942,47 @@ def collapse_chains(rows, macs=None, min_weight=0.7):
 
     # 2) stream continuation edges
     if macs:
-        from datetime import datetime
+        from bisect import bisect_left, bisect_right
+        from datetime import datetime, timedelta
         max_gap = wm.get("stream_max_gap_seconds", 600)
         level_gate = wm.get("stream_level_gate", 4)
         claimed = {a for a, _b, _w in edges}  # MACs already bound as predecessor
         ordered = sorted(macs.values(), key=lambda m: m["first_ts"])
+        # End-time index (the 12:50 perf HIGH's second O(M^2) loop: 16M
+        # iterations at 4k MACs). A predecessor A can only bind B when
+        # A's LAST sighting falls within stream_max_gap before B's FIRST —
+        # the window shrinks the scan to the handful of MACs that actually
+        # ended recently. _parse_ts normalizes naive→aware, so one index
+        # (chronologically correct, no naive/aware compare issues) suffices.
+        t_last = {m["mac"]: _parse_ts(m["last_ts"]) for m in macs.values()}
+        end_sorted = sorted((t_last[m["mac"]], m["mac"]) for m in macs.values()
+                            if t_last[m["mac"]] is not None)
+        end_ts = [t for t, _m in end_sorted]
+        end_mac = [m for _t, m in end_sorted]
         for B in ordered:
             t_b = _parse_ts(B["first_ts"])
             if t_b is None:
                 continue
+            lo = bisect_left(end_ts, t_b - timedelta(seconds=max_gap))
+            hi = bisect_right(end_ts, t_b)
+            window = [end_mac[i] for i in range(lo, hi)]
+            if not window:
+                continue
+            # same iteration order as the old scan (first-seen order) so
+            # equal-fit ties resolve identically
+            window.sort(key=lambda m: (macs[m]["first_ts"], m))
             best, best_key = None, None
-            for A in ordered:
-                if A["mac"] == B["mac"] or A["mac"] in claimed:
+            for cand in window:
+                if cand == B["mac"] or cand in claimed:
                     continue
-                # ordered by first_ts: any candidate needs A.first < B.first
-                # (A must end before B starts, so it starts earlier too)
+                A = macs[cand]
+                # temporal order: A must have ENDED before B started —
+                # guaranteed by the window (t_a <= t_b). The old code's
+                # string-order break also excluded same-first-seen MACs
+                # (zero-length predecessors); mirror that exactly.
                 if A["first_ts"] >= B["first_ts"]:
-                    break
-                # temporal order: A must have ENDED before B started. Same
-                # second = same scan batch (the node timestamps a whole scan
-                # batch with one received_at) — still sequential, allow it;
-                # the company filter below is what keeps parallel identities
-                # apart.
-                try:
-                    t_a = _parse_ts(A["last_ts"])
-                except Exception:
                     continue
-                if t_a is None or t_a > t_b:
-                    continue
-                gap = (t_b - t_a).total_seconds()
-                if gap > max_gap:
-                    continue
+                gap = (t_b - t_last[cand]).total_seconds()
                 if tier_of(A["avg_rssi"]) != "STRONG" or tier_of(B["avg_rssi"]) != "STRONG":
                     continue
                 if abs(A["avg_rssi"] - B["avg_rssi"]) > level_gate:
@@ -989,7 +999,7 @@ def collapse_chains(rows, macs=None, min_weight=0.7):
                 # rank: same known company first, then tightest gap
                 key = (0 if (ca and cb and ca == cb) else 1, gap)
                 if best_key is None or key < best_key:
-                    best, best_key = A["mac"], key
+                    best, best_key = cand, key
             if best is not None:
                 edges.append((best, B["mac"], 1.0))
                 claimed.add(best)
@@ -1031,7 +1041,9 @@ def collapse_chains(rows, macs=None, min_weight=0.7):
 def print_chains(c, hours=24):
     rows, macs = analyze_handoffs(c, hours, report=False, return_macs=True)
     chains = collapse_chains(rows, macs)
-    print(f"\nENTITY CHAINS ({len(chains)} from {len(rows)} handoff pairs):")
+    gap = WM.get("stream_max_gap_seconds", 600)
+    print(f"\nENTITY CHAINS ({len(chains)} from {len(rows)} handoff pairs, "
+          f"{hours}h window, ≤{gap}s gap):")
     print("-" * 70)
     for chain in sorted(chains, key=len, reverse=True):
         # Look up labels for the first MAC
@@ -1454,23 +1466,54 @@ def analyze_handoffs(c, hours=24, report=True, return_macs=False):
         return 1.0, "-"
 
     rows = []
-    mac_list = list(macs.keys())
-    for i, a in enumerate(mac_list):
-        for b in mac_list[i+1:]:
-            A, B = macs[a], macs[b]
-            # temporal order: A ends before B starts
-            if A["last_ts"] > B["first_ts"]:
+    # Pairs are generated from a WINDOWED scan instead of the full O(M^2)
+    # loop (the 12:50 perf HIGH: 8M iterations + 3.78M dicts ~2.5-3GB at
+    # 72h on 4k MACs — the 168h pass OOM'd a no-swap box). Only pairs with
+    # A ending within stream_max_gap of B starting can ever matter:
+    #   - chain edges need weight >= min_weight (0.7); the strongest class
+    #     multiplier (1.5) caps the gap at ~69s — far inside the window.
+    #   - the report shows the top-40 STRONG pairs by weight; beyond the
+    #     window weight is ~0.00 and nothing displays.
+    # Timestamps are parsed ONCE per MAC (same expression the loop used).
+    # Naive/aware mixing: the old loop only ever subtracted same-kind
+    # timestamps (a mixed pair raised TypeError and was skipped) — two
+    # parallel end-time indexes preserve that exactly.
+    from bisect import bisect_left, bisect_right
+    from datetime import datetime, timedelta
+
+    def _pair_parse(iso):
+        try:
+            return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    t_first = {m: _pair_parse(v["first_ts"]) for m, v in macs.items()}
+    t_last = {m: _pair_parse(v["last_ts"]) for m, v in macs.items()}
+    pair_window = wm.get("stream_max_gap_seconds", 600)
+    naive_ends = sorted((t_last[m], m) for m in macs
+                        if t_last[m] is not None and t_last[m].tzinfo is None)
+    aware_ends = sorted((t_last[m], m) for m in macs
+                        if t_last[m] is not None and t_last[m].tzinfo is not None)
+    def _sortable(dt):
+        return dt.replace(tzinfo=None) if dt is not None else None
+
+    for b in sorted(macs.keys(), key=lambda m: (t_first[m] is None,
+                                                _sortable(t_first[m]) or datetime.min)):
+        t_b = t_first[b]
+        if t_b is None:
+            continue  # unparseable B — every pair involving it was skipped
+        ends = aware_ends if t_b.tzinfo is not None else naive_ends
+        lo = bisect_left(ends, (t_b - timedelta(seconds=pair_window), ""))
+        hi = bisect_right(ends, (t_b, "\xff" * 32))
+        for _t_a, a in ends[lo:hi]:
+            if a == b:
                 continue
-            # Layer 2: gap between A's last and B's first
-            from datetime import datetime
+            A, B = macs[a], macs[b]
+            t_a = t_last[a]
             try:
-                t_a = datetime.fromisoformat(A["last_ts"].replace("Z", "+00:00"))
-                t_b = datetime.fromisoformat(B["first_ts"].replace("Z", "+00:00"))
                 gap_s = (t_b - t_a).total_seconds()
             except Exception:
-                continue
-            if gap_s < 0:
-                continue
+                continue  # mixed naive/aware — skipped by the old loop too
             # Layer 2: decay weight
             weight = math.exp(-gap_s / tau)
 
@@ -1504,7 +1547,9 @@ def analyze_handoffs(c, hours=24, report=True, return_macs=False):
     # Report: rotations first (tight gap + continuity), then jumps
     rows.sort(key=lambda r: (-(r["kind"] == "ROTATION?"), -r["weight"]))
     if report:
-        print(f"Three-layer handoffs + class coherence ({len(rows)} pairs):")
+        gap = wm.get("stream_max_gap_seconds", 600)
+        print(f"Three-layer handoffs + class coherence "
+              f"({len(rows)} pairs, ≤{gap}s gap):")
         print(f"{'FROM':<20} {'TO':<20} {'ΔdB':>4} {'gap_s':>6} {'w':>5}  class       kind")
         print("-" * 78)
         shown = 0
@@ -1836,7 +1881,19 @@ def where_view(c, label):
             quick[d["mac"]] = dict(r) if r and r["n"] else None
         macs = slot_of = None
         owner_assign = owner_claim = None
-        if any(q is None for q in quick.values()):
+        # The chain pass only helps seeds that HAVE sightings history (a
+        # stale slot resolves to its current occupant). A never-sighted
+        # seed (WiFi-only identity) is UNSEEN unconditionally — running
+        # the full 168h pass just to print that was the 12:50 timeout.
+        need_chains = False
+        for d in devs:
+            if quick[d["mac"]] is None:
+                r = c.execute("SELECT 1 FROM sightings WHERE mac=? LIMIT 1",
+                              (d["mac"],)).fetchone()
+                if r is not None:
+                    need_chains = True
+                    break
+        if need_chains:
             rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
             chains = collapse_chains(rows, macs)
             slot_of = {}
