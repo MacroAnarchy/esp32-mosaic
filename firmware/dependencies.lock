@@ -9,13 +9,114 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.5.3
+  espressif/esp-radar:
+    component_hash: d29797dd46619d4b2a3ad332eeb97397e55f8ef2d62970d0fc228f092420f15e
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: espressif/esp_csi_gain_ctrl
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.1.3'
+    - name: espressif/esp_radar_motion_dec
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.1.1'
+    - name: idf
+      require: private
+      version: '>=5.4'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    - esp32s2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    version: 0.3.4
+  espressif/esp_csi_gain_ctrl:
+    component_hash: 2700b6625343916dfb721af42131857b3e387dbbb9cc1df569128525c8b05f8e
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    - esp32s2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    version: 0.1.5
+  espressif/esp_radar_motion_dec:
+    component_hash: c4e2ff510fb3ffff2cc6347b059e4c264515aebb1cf427ca3bc9398b4941b857
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    - esp32s2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    version: 0.1.1
+  espressif/esp_wifi_sensing:
+    component_hash: 7fbba8fc784626452d79f9345432cb9535073d7970fca5bc8d269f3c69b5de71
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: espressif/esp-radar
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.3.3'
+    - name: idf
+      require: private
+      version: '>=5.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    - esp32s2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    version: 0.1.1~2
   idf:
     source:
       type: idf
     version: 5.5.3
 direct_dependencies:
 - espressif/cmake_utilities
+- espressif/esp_wifi_sensing
 - idf
-manifest_hash: 9762a6c57823a70b8e45796fbdc801607ea32282c758d37af16ddfda5702502a
+manifest_hash: 7af998d9e751ca5d0b219654d47a7e9768479659b3e36b49e677af234834c774
 target: esp32s3
 version: 2.0.0

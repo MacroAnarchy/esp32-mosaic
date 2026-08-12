@@ -93,3 +93,27 @@
 // firmware/src/arp_neighbors.h).
 #define MOSAIC_ARP_SCAN_NETWORK "192.168.1.0"
 #define MOSAIC_ARP_SCAN_MASK "255.255.255.0"
+
+// --- WiFi CSI motion sensing, Tier 1 (default ON; [env:ui] only) ---
+// The node's WiFi radio reads Channel State Information from the traffic
+// of the router it is associated with (monostatic geometry — one node
+// listening to its home AP, no dedicated transmitter). The Espressif
+// esp_wifi_sensing component (Apache-2.0) turns the CSI stream into
+// motion start/stop events, reported as type:"csi" envelopes. Tier 1
+// scope: MOTION ONLY (moved/empty events). No vitals, no activity
+// classification, no verified stationary presence — those are later
+// tiers. The Arduino [env:esp32] build does not compile this (CSI is
+// ESP-IDF only). See docs/protocol.md ("csi") and
+// firmware/components/sense/csi_sensing.cpp.
+
+// Enable WiFi CSI motion sensing on the [env:ui] firmware.
+#define MOSAIC_CSI_ENABLE 1
+
+// Router ping rate (Hz) that keeps the CSI sampling path fed with
+// traffic. Component default is 100; lower values are gentler on the
+// network, higher values sample the room more often.
+#define MOSAIC_CSI_PING_FREQUENCY_HZ 100
+
+// Motion sensitivity, x1000 scale (1..1000; component default 500 = 0.5).
+// Larger = more sensitive = more false-positive motion events.
+#define MOSAIC_CSI_SENSITIVITY 500
