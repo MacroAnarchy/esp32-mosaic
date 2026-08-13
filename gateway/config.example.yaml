@@ -142,3 +142,9 @@ world_model:
   channel_wifi_max_age_seconds: 900     # beacon snapshots every few min
   channel_probes_max_age_seconds: 3600  # probe requests (opportunistic)
   channel_csi_max_age_seconds: 43200    # body/motion events (12h quiet OK)
+
+  # Node registry hygiene: one-off test registrations (sub-minute lives,
+  # loopback IPs) would show 'GONE' in --status forever. List them here so
+  # the node roster shows only real sensors. Empty by default — the repo
+  # stays neutral; each deployment opts in.
+  node_ignore_list: []

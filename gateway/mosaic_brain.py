@@ -174,6 +174,11 @@ DEFAULT_WM = {
     "channel_wifi_max_age_seconds": 900,
     "channel_probes_max_age_seconds": 3600,
     "channel_csi_max_age_seconds": 43200,
+    # Node registry hygiene: one-off test registrations (sub-minute lives,
+    # loopback IPs) would show 'GONE' in --status forever. Deployments list
+    # them here so the node roster shows only real sensors. Empty by default —
+    # the repo stays neutral; each deployment opts in via config.yaml.
+    "node_ignore_list": [],
 }
 
 
@@ -1032,11 +1037,14 @@ def channel_health(c, report=True):
     now = datetime.now(timezone.utc)
     # node heartbeats first — needed to tell QUIET (pipeline alive,
     # nothing to hear) from OFFLINE (no node reporting = channel unfed)
+    ignore = set(WM.get("node_ignore_list", []) or [])
     nodes = []
     try:
         for r in c.execute(
                 "SELECT node_id, MAX(last_seen) last_seen FROM nodes "
                 "GROUP BY node_id ORDER BY last_seen DESC"):
+            if r["node_id"] in ignore:
+                continue
             dt = _parse_ts(r["last_seen"])
             age = (now - dt).total_seconds() if dt else None
             nodes.append({"node": r["node_id"], "age_s": age})
@@ -1889,11 +1897,13 @@ def probes_view(c, limit=20):
 
     A client probing for an SSID registered as a place = a device that KNOWS
     our network (returning entity) — identity from the air, no connection.
+    Per-client strength + recency are printed so an in-apartment probe
+    (-33 dBm, hours ago) is distinguishable from neighbor noise (-90 dBm,
+    days ago) without raw SQL.
     """
     ensure_schema(c)
     rows = [dict(r) for r in c.execute(
         """SELECT ssid, COUNT(*) AS n, COUNT(DISTINCT client_mac) AS clients,
-                  GROUP_CONCAT(DISTINCT client_mac) AS macs,
                   MAX(received_at) AS last_seen
            FROM probes WHERE ssid IS NOT NULL AND ssid != ''
            GROUP BY ssid ORDER BY n DESC LIMIT ?""", (limit,))]
@@ -1904,17 +1914,34 @@ def probes_view(c, limit=20):
     known = {r["ssid"] for r in c.execute("SELECT ssid FROM places WHERE ssid IS NOT NULL")}
     seed_label = {r["mac"]: r["label"] for r in c.execute(
         "SELECT mac, label FROM devices WHERE label IS NOT NULL")}
+    clients = {r["ssid"]: [] for r in rows}
+    for r in c.execute(
+            """SELECT ssid, client_mac, COUNT(*) AS n, MAX(rssi) AS best_rssi,
+                      MAX(received_at) AS last_seen
+               FROM probes WHERE ssid IS NOT NULL AND ssid != ''
+               GROUP BY ssid, client_mac ORDER BY COUNT(*) DESC"""):
+        if r["ssid"] in clients:
+            clients[r["ssid"]].append(dict(r))
+    now = datetime.now(timezone.utc)
     print(f"{'SSID':<24} {'probes':>6} {'clients':>7}  known-network seekers")
     print("-" * 76)
     for r in rows:
         seek = "RETURNING?" if r["ssid"] in known else ""
         print(f"{(r['ssid'] or '?')[:23]:<24} {r['n']:>6} {r['clients']:>7}  {seek}")
-        macs = (r["macs"] or "").split(",")[:6]
-        for m in macs:
-            mark = f"  ★ {seed_label[m]}" if m in seed_label else ""
-            print(f"    └ {m}{mark}")
-    seen_seed = any(m in seed_label
-                    for r in rows for m in (r["macs"] or "").split(","))
+        for m in clients[r["ssid"]][:6]:
+            mark = f"  ★ {seed_label[m['client_mac']]}" if m["client_mac"] in seed_label else ""
+            dt = _parse_ts(m["last_seen"])
+            age = (now - dt).total_seconds() / 3600 if dt else None
+            if age is None:
+                age_s = "?"
+            elif age >= 1:
+                age_s = f"{age:.1f}h ago"
+            else:
+                age_s = f"{age * 60:.0f}min ago"
+            print(f"    └ {m['client_mac']}{mark}  {m['n']}×  "
+                  f"best {m['best_rssi']} dBm  last {m['last_seen'][:19]} ({age_s})")
+    seen_seed = any(m["client_mac"] in seed_label
+                    for r in rows for m in clients[r["ssid"]])
     if seen_seed:
         print("  ★ = labeled seed — a seed MAC directed-probing an SSID is "
               "join-confirmation evidence (see --owner/--where)")
