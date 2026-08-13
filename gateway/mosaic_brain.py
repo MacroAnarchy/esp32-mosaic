@@ -23,13 +23,14 @@ Usage:
   python3 mosaic_brain.py --probes          # probe-request identity log
   python3 mosaic_brain.py --owner           # M1: is the owner home? (seed→chain resolution)
   python3 mosaic_brain.py --backfill-beacons  # rebuild beacon_samples from events
-  python3 mosaic_brain.py --where "home"    # resolve a place label via BSSIDs
+  python3 mosaic_brain.py --where "home"    # resolve device/node/owner/MAC/place label
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -2154,97 +2155,313 @@ def _where_chain_path(d, macs, slot_of, owner_assign, owner_claim):
                   f"— level-matched, unbound")
 
 
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", re.IGNORECASE)
+
+
+def _named_devices(c):
+    """Latest non-findmy broadcast name per MAC — the name-reported label
+    space (shared by --devices, --where exact and --where prefix)."""
+    out = []
+    for r in c.execute("""
+        SELECT mac, name, device_class
+        FROM sightings s
+        WHERE name IS NOT NULL AND trim(name) != ''
+          AND COALESCE(device_class, '') != 'findmy'
+          AND id IN (SELECT MAX(id) FROM sightings
+                     WHERE name IS NOT NULL AND trim(name) != ''
+                     GROUP BY mac)
+    """):
+        out.append({"mac": r["mac"], "name": r["name"].strip(),
+                    "device_class": r["device_class"]})
+    return out
+
+
+def _label_for_mac(c, mac):
+    """Human label for a MAC: seeded label, else latest broadcast name."""
+    r = c.execute("SELECT label FROM devices WHERE mac=?", (mac,)).fetchone()
+    if r and r["label"]:
+        return r["label"]
+    r = c.execute(
+        "SELECT name FROM sightings WHERE mac=? AND name IS NOT NULL "
+        "AND trim(name) != '' ORDER BY id DESC LIMIT 1", (mac,)).fetchone()
+    return r["name"] if r else None
+
+
+def _where_print_device(c, label):
+    """DEVICE lookup: seeded label or seed MAC (devices table) resolves
+    FIRST — 'where is my phone' is the killer question. A seeded MAC may be
+    an old rotating identity, so a seed with no fresh sightings is traced
+    through entity chains to its slot's CURRENT occupant (same machinery as
+    owner_view). Returns True when the label resolved to a device."""
+    devs = [dict(r) for r in c.execute(
+        "SELECT mac, COALESCE(label, mac) AS label, note, stable FROM devices "
+        "WHERE lower(label) = lower(?) OR lower(mac) = lower(?)",
+        (label, label))]
+    if not devs:
+        return False
+    # Quick path: the seed itself was seen in the last 24h → answer
+    # without the (costly) chain pass. Only stale seeds need chains.
+    w_start = (datetime.now(timezone.utc) -
+               timedelta(hours=24)).isoformat(timespec="seconds").replace("T", " ")
+    quick = {}
+    for d in devs:
+        r = c.execute(
+            """SELECT COUNT(*) n, MIN(rssi) mn, MAX(rssi) mx,
+                      ROUND(AVG(rssi),1) avg, MAX(received_at) last_seen
+               FROM sightings
+               WHERE mac=? AND REPLACE(substr(received_at,1,19),'T',' ') > ?""",
+            (d["mac"], w_start)).fetchone()
+        quick[d["mac"]] = dict(r) if r and r["n"] else None
+    macs = slot_of = None
+    owner_assign = owner_claim = None
+    # The chain pass only helps seeds that HAVE sightings history (a
+    # stale slot resolves to its current occupant). A never-sighted
+    # seed (WiFi-only identity) is UNSEEN unconditionally — running
+    # the full 168h pass just to print that was the 12:50 timeout.
+    need_chains = False
+    for d in devs:
+        if quick[d["mac"]] is None:
+            r = c.execute("SELECT 1 FROM sightings WHERE mac=? LIMIT 1",
+                          (d["mac"],)).fetchone()
+            if r is not None:
+                need_chains = True
+                break
+    if need_chains:
+        rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
+        chains = collapse_chains(rows, macs)
+        slot_of = {}
+        for ch in chains:
+            for m in ch:
+                slot_of[m] = ch
+        # The live-candidate step must agree with --owner: compute the
+        # SAME no-reuse assignment over the owner seeds (a queried seed
+        # never borrows a candidate another identity already claimed).
+        owner_assign, owner_claim = _owner_assignment(c, macs, slot_of)
+    print(f"\nDEVICE '{label}' — resolved through entity chains (168h):")
+    print("-" * 78)
+    for d in devs:
+        q = quick[d["mac"]]
+        if q is not None:
+            print(f"  {d['label']:<24} last seen {q['last_seen']} — "
+                  f"n={q['n']} avg {q['avg']} dB ({q['mn']}..{q['mx']}), "
+                  f"zone {zone_of(q['avg'])}")
+        elif macs is None or slot_of is None:
+            state, detail, note = _seed_network_evidence(c, d["mac"])
+            print(f"  {d['label']:<24} {state} — {detail}{note}")
+        else:
+            _where_chain_path(d, macs, slot_of, owner_assign, owner_claim)
+    return True
+
+
+def _where_print_place(c, label):
+    """PLACE lookup: locations.json label → BSSIDs → current beacon picture."""
+    locations = load_locations()
+    ll = label.lower()
+    bssids = [b for b, info in locations.items()
+              if isinstance(info, dict) and
+              str(info.get("label", "")).lower() == ll]
+    if not bssids:
+        return False
+    print(f"\nPLACE '{label}' — learned place (locations.json → BSSID beacons):")
+    print("-" * 78)
+    for bssid in bssids:
+        r = c.execute("SELECT * FROM places WHERE bssid=?", (bssid,)).fetchone()
+        if not r:
+            print(f"  {bssid} ({label}): no beacon sightings yet")
+            continue
+        print(f"  {bssid} ({label}) — ssid={r['ssid']} ch={r['channel']} "
+              f"seen={r['seen_count']} rssi={r['min_rssi']}..{r['max_rssi']} "
+              f"avg={r['avg_rssi']:.1f} last={r['last_seen']} "
+              f"{'PLACE' if r['stable'] else 'not-yet-place'}")
+    return True
+
+
+def _where_print_named(c, label):
+    """NAME-REPORTED broadcast devices — the label space --status/--devices
+    print (SnowPax, Galaxy Fit3, ThermoBeacon, ...). Earned from the device
+    itself, not from the devices table — 'every label the system shows is
+    queryable' (04:55 LOW)."""
+    hits = [d for d in _named_devices(c)
+            if d["name"].lower() == label.lower()]
+    if not hits:
+        return False
+    stats = {r["mac"]: r for r in device_stats(c, 24)}
+    print(f"\nDEVICE '{label}' — name-reported broadcast label (the device "
+          f"tells us its name):")
+    print("-" * 78)
+    for h in hits:
+        mac = h["mac"]
+        st = stats.get(mac)
+        last = c.execute("SELECT MAX(received_at) v FROM sightings WHERE mac=?",
+                         (mac,)).fetchone()["v"]
+        seed = c.execute("SELECT label FROM devices WHERE mac=?",
+                         (mac,)).fetchone()
+        if st:
+            cls = _movement_class(st["spread"])
+            line = (f"  {mac} — last seen {last} · window n={st['n']} "
+                    f"avg {st['avg_rssi']} dB (spread {st['spread']:.0f} dB → "
+                    f"{cls}) · zone {zone_of(st['avg_rssi'])}")
+            if st.get("device_class"):
+                line += f" · class {st['device_class']}"
+        else:
+            line = f"  {mac} — last seen {last} · outside the 24h window"
+        print(line)
+        if seed and seed["label"]:
+            print(f"    └ also a labeled seed: {seed['label']}")
+    return True
+
+
+def _where_print_node(c, q):
+    """NODE lookup — 'where is my orb/robot' (20:50/00:50/13:20 filings).
+    Answers with the node's liveness, identity, and what it currently sees."""
+    row = c.execute(
+        "SELECT node_id, first_seen, last_seen, last_ip, model, firmware "
+        "FROM nodes WHERE lower(node_id) = lower(?)", (q,)).fetchone()
+    if not row:
+        return False
+    now = datetime.now(timezone.utc)
+    dt = _parse_ts(row["last_seen"])
+    age = (now - dt).total_seconds() if dt else None
+    state = ("LIVE" if age is not None and age <= 600
+             else ("STALE" if age is not None and age <= 7200 else "GONE"))
+    age_s = f"{age/3600:.1f}h" if age is not None else "n/a"
+    print(f"\nNODE '{row['node_id']}' — a sensing node (the brain's eye):")
+    print("-" * 78)
+    print(f"  node {row['node_id']} {state} — last contact {age_s} ago "
+          f"({row['last_seen']})")
+    if row["last_ip"] or row["model"] or row["firmware"]:
+        print(f"  ip {row['last_ip'] or '-'}  model {row['model'] or '-'}  "
+              f"firmware {row['firmware'] or '-'}")
+    # What this node currently sees: distinct devices + its strongest few.
+    w_start = (now - timedelta(hours=24)).isoformat(timespec="seconds").replace("T", " ")
+    try:
+        n_macs = c.execute(
+            "SELECT COUNT(DISTINCT mac) n FROM sightings "
+            "WHERE node_id=? AND REPLACE(substr(received_at,1,19),'T',' ') > ?",
+            (row["node_id"], w_start)).fetchone()["n"]
+        top = c.execute(
+            "SELECT mac, MAX(rssi) best, MAX(received_at) last FROM sightings "
+            "WHERE node_id=? AND REPLACE(substr(received_at,1,19),'T',' ') > ? "
+            "GROUP BY mac ORDER BY best DESC LIMIT 3",
+            (row["node_id"], w_start)).fetchall()
+    except Exception:
+        n_macs, top = None, []
+    if n_macs:
+        print(f"  sees {n_macs} distinct devices in the last 24h; strongest:")
+        for t in top:
+            nm = _label_for_mac(c, t["mac"])
+            print(f"    {t['mac']}  {('(' + nm + ') ') if nm else ''}"
+                  f"@ {t['best']} dB  last {t['last']}")
+    else:
+        print("  no sightings reported in the last 24h")
+    return True
+
+
+def _where_print_mac(c, mac):
+    """RAW-MAC lookup (any MAC, sighted or not)."""
+    mac = mac.lower()
+    print(f"\nMAC {mac} — raw address lookup:")
+    print("-" * 78)
+    last = c.execute("SELECT MAX(received_at) v FROM sightings WHERE mac=?",
+                     (mac,)).fetchone()["v"]
+    if not last:
+        print("  never sighted by the BLE sniffer")
+        return
+    st = next((r for r in device_stats(c, 24) if r["mac"] == mac), None)
+    if st:
+        cls = _movement_class(st["spread"])
+        print(f"  last seen {last} · window n={st['n']} avg {st['avg_rssi']} dB "
+              f"(spread {st['spread']:.0f} dB → {cls}) · "
+              f"zone {zone_of(st['avg_rssi'])}")
+    else:
+        print(f"  last seen {last} · outside the 24h window (no stats)")
+
+
+def _where_prefix(c, q):
+    """Case-insensitive PREFIX match over devices + broadcast names + nodes.
+    A unique match resolves through its own path; ambiguity is listed."""
+    ql = q.lower()
+    cands = []
+    for r in c.execute("SELECT DISTINCT label FROM devices "
+                       "WHERE label IS NOT NULL AND trim(label) != ''"):
+        if r["label"].lower().startswith(ql):
+            cands.append(("device", r["label"]))
+    for d in _named_devices(c):
+        if d["name"].lower().startswith(ql):
+            cands.append(("device", d["name"]))
+    for r in c.execute("SELECT DISTINCT node_id FROM nodes"):
+        if r["node_id"].lower().startswith(ql):
+            cands.append(("node", r["node_id"]))
+    cands = sorted(set(cands))
+    if not cands:
+        return False
+    if len(cands) == 1:
+        typ, name = cands[0]
+        if typ == "node":
+            _where_print_node(c, name)
+        else:
+            if not _where_print_named(c, name):
+                _where_print_device(c, name)
+        return True
+    print(f"'{q}' matches {len(cands)} labels — be specific:")
+    for typ, name in cands:
+        print(f"  {typ:<7} {name}")
+    return True
+
+
 def where_view(c, label):
     """mosaic_where: resolve a label to its current location picture.
 
-    DEVICE labels (devices table) resolve FIRST — 'where is my phone' is
-    the killer question. A seeded MAC may be an old rotating identity, so
-    a seed with no fresh sightings is traced through entity chains to its
-    slot's CURRENT occupant (same machinery as owner_view). Falls back to
-    PLACE labels (locations.json → BSSIDs → beacon picture). Unknown
-    labels list what IS known, so the operator sees the vocabulary.
+    Resolution order — every name the system prints is queryable:
+      1. 'owner' alias → the seeded owner entity group (M1 resolution)
+      2. exact device label or seed MAC (devices table; chains when stale)
+      3. exact place label (locations.json → BSSIDs → beacon picture)
+      4. exact name-reported broadcast label (--devices' label space)
+      5. exact node name (nodes registry — 'where is my orb/robot')
+      6. raw MAC (any MAC, sighted or not)
+      7. case-insensitive prefix (unique match resolves, else lists)
+    Unknown labels list what IS known (devices, places, nodes).
     """
     ensure_schema(c)
-    devs = [dict(r) for r in c.execute(
-        "SELECT mac, label, note, stable FROM devices WHERE lower(label) = lower(?)",
-        (label,))]
-    if devs:
-        # Quick path: the seed itself was seen in the last 24h → answer
-        # without the (costly) chain pass. Only stale seeds need chains.
-        w_start = (datetime.now(timezone.utc) -
-                   timedelta(hours=24)).isoformat(timespec="seconds").replace("T", " ")
-        quick = {}
-        for d in devs:
-            r = c.execute(
-                """SELECT COUNT(*) n, MIN(rssi) mn, MAX(rssi) mx,
-                          ROUND(AVG(rssi),1) avg, MAX(received_at) last_seen
-                   FROM sightings
-                   WHERE mac=? AND REPLACE(substr(received_at,1,19),'T',' ') > ?""",
-                (d["mac"], w_start)).fetchone()
-            quick[d["mac"]] = dict(r) if r and r["n"] else None
-        macs = slot_of = None
-        owner_assign = owner_claim = None
-        # The chain pass only helps seeds that HAVE sightings history (a
-        # stale slot resolves to its current occupant). A never-sighted
-        # seed (WiFi-only identity) is UNSEEN unconditionally — running
-        # the full 168h pass just to print that was the 12:50 timeout.
-        need_chains = False
-        for d in devs:
-            if quick[d["mac"]] is None:
-                r = c.execute("SELECT 1 FROM sightings WHERE mac=? LIMIT 1",
-                              (d["mac"],)).fetchone()
-                if r is not None:
-                    need_chains = True
-                    break
-        if need_chains:
-            rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
-            chains = collapse_chains(rows, macs)
-            slot_of = {}
-            for ch in chains:
-                for m in ch:
-                    slot_of[m] = ch
-            # The live-candidate step must agree with --owner: compute the
-            # SAME no-reuse assignment over the owner seeds (a queried seed
-            # never borrows a candidate another identity already claimed).
-            owner_assign, owner_claim = _owner_assignment(c, macs, slot_of)
-        print(f"\nDEVICE '{label}' — resolved through entity chains (168h):")
-        print("-" * 78)
-        for d in devs:
-            q = quick[d["mac"]]
-            if q is not None:
-                print(f"  {d['label']:<24} last seen {q['last_seen']} — "
-                      f"n={q['n']} avg {q['avg']} dB ({q['mn']}..{q['mx']}), "
-                      f"zone {zone_of(q['avg'])}")
-            elif macs is None or slot_of is None:
-                state, detail, note = _seed_network_evidence(c, d["mac"])
-                print(f"  {d['label']:<24} {state} — {detail}{note}")
-            else:
-                _where_chain_path(d, macs, slot_of, owner_assign, owner_claim)
+    q = (label or "").strip()
+    if not q:
+        print("--where needs a label, node name, 'owner', or raw MAC.")
         return
-    # Place fallback: label → BSSIDs → current beacon picture (original path).
-    locations = load_locations()
-    bssids = [b for b, info in locations.items()
-              if isinstance(info, dict) and info.get("label") == label]
-    if bssids:
-        for bssid in bssids:
-            r = c.execute("SELECT * FROM places WHERE bssid=?", (bssid,)).fetchone()
-            if not r:
-                print(f"  {bssid} ({label}): no beacon sightings yet")
-                continue
-            print(f"  {bssid} ({label}) — ssid={r['ssid']} ch={r['channel']} "
-                  f"seen={r['seen_count']} rssi={r['min_rssi']}..{r['max_rssi']} "
-                  f"avg={r['avg_rssi']:.1f} last={r['last_seen']} "
-                  f"{'PLACE' if r['stable'] else 'not-yet-place'}")
+    if q.lower() == "owner":
+        print("\n'owner' → the seeded owner entity group (M1 resolution):")
+        print("-" * 78)
+        owner_view(c)
+        return
+    if _where_print_device(c, q):
+        return
+    if _where_print_place(c, q):
+        return
+    if _where_print_named(c, q):
+        return
+    if _where_print_node(c, q):
+        return
+    if _MAC_RE.match(q):
+        _where_print_mac(c, q)
+        return
+    if _where_prefix(c, q):
         return
     known_devs = [r["label"] for r in c.execute(
-        "SELECT DISTINCT label FROM devices WHERE label IS NOT NULL ORDER BY label")]
-    known_places = sorted({lbl for info in locations.values()
-                           if isinstance(info, dict) and (lbl := info.get("label"))})
-    print(f"No label '{label}' in the devices table or {LOCATIONS_FILE}.")
+        "SELECT DISTINCT label FROM devices WHERE label IS NOT NULL "
+        "ORDER BY label")]
+    known_places = sorted({lbl for info in load_locations().values()
+                           if isinstance(info, dict)
+                           and (lbl := info.get("label"))})
+    known_nodes = [r["node_id"] for r in c.execute(
+        "SELECT DISTINCT node_id FROM nodes ORDER BY node_id")]
+    print(f"No label '{q}' in the devices table, places, or node registry.")
     if known_devs:
         print(f"  Known device labels: {', '.join(known_devs)}")
     if known_places:
         print(f"  Known place labels:  {', '.join(known_places)}")
+    if known_nodes:
+        print(f"  Known node names:    {', '.join(known_nodes)}")
+    print("  Tip: prefixes match case-insensitively ('--where tiger' works), "
+          "'owner' aliases the owner group, raw MACs resolve too.")
 
 
 def main():
@@ -2269,8 +2486,8 @@ def main():
     ap.add_argument("--backfill-beacons", action="store_true",
                     help="rebuild beacon_samples from events JSON history")
     ap.add_argument("--where", metavar="LABEL",
-                    help="resolve a device label (devices table → entity chain slots) "
-                         "or place label (locations.json → BSSIDs)")
+                    help="resolve device label, seed MAC, node name, 'owner', "
+                         "raw MAC, or place label (locations.json → BSSIDs)")
     ap.add_argument("--hours", type=int, default=24, help="lookback window (default 24)")
     args = ap.parse_args()
 
