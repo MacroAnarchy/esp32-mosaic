@@ -87,6 +87,7 @@ static float *s_ringScratch[3];  /* 128 samples: x, y, intensity */
 static float *s_waveScratch[3];  /* CSI_WAVE_N samples            */
 static float *s_haloScratch[3];  /* 150 samples                   */
 static float *s_ripScratch[3];   /* 72 samples                    */
+static float *s_domeRingScratch[3]; /* 56 samples: dome RSSI rings */
 
 static void csi_scratch_alloc(void)
 {
@@ -105,6 +106,10 @@ static void csi_scratch_alloc(void)
     p = (float *)heap_caps_malloc(72 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);
     if (p == nullptr) p = (float *)malloc(72 * 3 * sizeof(float));
     s_ripScratch[0] = p; s_ripScratch[1] = p + 72; s_ripScratch[2] = p + 144;
+
+    p = (float *)heap_caps_malloc(56 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (p == nullptr) p = (float *)malloc(56 * 3 * sizeof(float));
+    s_domeRingScratch[0] = p; s_domeRingScratch[1] = p + 56; s_domeRingScratch[2] = p + 112;
 }
 
 /* 8-bit color channel scaled by an intensity 0..1, clamped (addLine
@@ -232,7 +237,6 @@ static DomeParticle s_pool[DOME_POOL_SIZE];
 static sense_device_t s_snap[DOME_MAX_DEVICES];  /* sense table snapshot */
 static uint32_t s_frame = 0;                     /* render frame counter */
 static float s_time = 0.0f;                      /* frames as float */
-static float s_sweepAngle = 0.0f;                /* radar sweep (rad) */
 
 /* ------------------------------------------------------------------ */
 /* CSI visualization state — driven by REAL sense-engine features      */
@@ -783,9 +787,9 @@ static void dome_spawn_burst(const DomeDevice &d)
         p->life = 40.0f;
         p->u = rndf(0.0f, 0.22f);           /* some shards already flying */
         p->speed = rndf(0.045f, 0.075f);
-        p->tx = kCenterX + cosf(a) * rr;
-        p->ty = kCenterY + sinf(a) * rr;
-        p->px = -sinf(a); p->py = cosf(a);
+        p->tx = kCenterX + lut_cos(a) * rr;
+        p->ty = kCenterY + lut_sin(a) * rr;
+        p->px = -lut_sin(a); p->py = lut_cos(a);
         p->wobAmp = rndf(0.5f, 2.5f);
         p->wobFreq = 0.0f;
         p->wobPhase = rndf(0.0f, 6.28f);
@@ -809,11 +813,11 @@ static void dome_spawn_implosion(const DomeDevice &d)
         p->life = 36.0f;
         p->u = rndf(0.0f, 0.15f);
         p->speed = rndf(0.05f, 0.09f);
-        p->x = kCenterX + cosf(a) * rr;    /* start: at the orb */
-        p->y = kCenterY + sinf(a) * rr;
+        p->x = kCenterX + lut_cos(a) * rr;    /* start: at the orb */
+        p->y = kCenterY + lut_sin(a) * rr;
         p->tx = kCenterX + rndf(-26.0f, 26.0f);  /* target: center cluster */
         p->ty = kCenterY + rndf(-26.0f, 26.0f);
-        p->px = -sinf(a); p->py = cosf(a);
+        p->px = -lut_sin(a); p->py = lut_cos(a);
         p->wobAmp = rndf(0.0f, 2.0f);
         p->wobFreq = 0.0f;
         p->wobPhase = rndf(0.0f, 6.28f);
@@ -838,9 +842,9 @@ static void dome_spawn_stream(const DomeDevice &d, float angle)
     p->life = 40.0f;
     p->u = 0.0f;
     p->speed = 0.045f + frac * 0.035f;   /* 12..22 frames per trip */
-    p->tx = kCenterX + cosf(a) * rr;
-    p->ty = kCenterY + sinf(a) * rr;
-    p->px = -sinf(a); p->py = cosf(a);
+    p->tx = kCenterX + lut_cos(a) * rr;
+    p->ty = kCenterY + lut_sin(a) * rr;
+    p->px = -lut_sin(a); p->py = lut_cos(a);
     p->wobAmp = 2.5f + frac * 5.0f;
     p->wobFreq = 0.5f + frac * 0.6f;
     p->wobPhase = frac * 6.28f;
@@ -930,7 +934,7 @@ static int dome_refresh(void)
         DomeDevice &d = s_dome[j];
         if (d.active && d.phase == 1 && ((s_frame + j * 3) % 8) == 0) {
             float a = d.baseAngle +
-                      d.driftAmp * sinf(s_time * 0.011f + d.driftPhase);
+                      d.driftAmp * lut_sin(s_time * 0.011f + d.driftPhase);
             dome_spawn_stream(d, a);
         }
     }
@@ -940,6 +944,10 @@ static int dome_refresh(void)
 /* ------------------------------------------------------------------ */
 /* Render helpers                                                      */
 /* ------------------------------------------------------------------ */
+
+/* Forward decl: the connected-band helper lives with the CSI code below. */
+static void draw_glow_band(const float *xs, const float *ys, const float *is,
+                           int n, const Rgb &col, float glowScale, int dotStride);
 
 static inline float dome_ease_out_cubic(float u)
 {
@@ -952,8 +960,9 @@ static inline float dome_ease_in_cubic(float u)
     return u * u * u;
 }
 
-/* Ambient dust — the calm empty-state field. Dims when the dome is
- * populated so the orbs read clearly. */
+/* Ambient dust — soft glowing motes (not 1px grain). Radius and
+ * intensity vary by a per-particle depth field for subtle layering.
+ * Dims when the dome is populated so orbs read clearly. LUT trig. */
 static void render_dust(const FaceStyle &st, int deviceCount, float gain)
 {
     const int n = st.particle_count;
@@ -963,8 +972,8 @@ static void render_dust(const FaceStyle &st, int deviceCount, float gain)
 
         /* Drift + jitter (agitated styles move erratically). */
         p.phase += st.agitated ? 6.0f : 1.2f;
-        float jx = st.rnd_speed * sinf(p.phase * 1.7f + i);
-        float jy = st.rnd_speed * cosf(p.phase * 2.3f + i);
+        float jx = st.rnd_speed * lut_sin(p.phase * 1.7f + i);
+        float jy = st.rnd_speed * lut_cos(p.phase * 2.3f + i);
         p.x += p.vx + jx;
         p.y += p.vy + jy;
 
@@ -973,86 +982,84 @@ static void render_dust(const FaceStyle &st, int deviceCount, float gain)
         float r2 = dx * dx + dy * dy;
         if (r2 > kRimR * kRimR) {
             float ang = rndf(0, 6.28f), rad = sqrtf(rndf(0, 1.0f)) * kRimR * 0.8f;
-            p.x = kCenterX + cosf(ang) * rad;
-            p.y = kCenterY + sinf(ang) * rad;
+            p.x = kCenterX + lut_cos(ang) * rad;
+            p.y = kCenterY + lut_sin(ang) * rad;
             p.vx = rndf(-st.speed, st.speed);
             p.vy = rndf(-st.speed, st.speed);
         }
 
-        /* Glow dot — voice state snaps intensity to mic energy. */
-        float intensity = 0.5f * domeGain * gain;
+        /* Soft glowing mote — size + brightness vary by depth band
+         * (i%4) for layered texture instead of uniform specks. */
+        float intensity = 0.42f * domeGain * gain;
         if (st.dim) {
             intensity *= 0.24f;
         } else if (st.agitated) {
-            intensity *= 0.55f + 0.35f * sinf(p.phase);
+            intensity *= 0.55f + 0.35f * lut_sin(p.phase);
         }
-        int radius = 3 + (i % 4);
-        s_canvas.addGlowDot(p.x, p.y, st.color, intensity, radius);
+        /* depth bands: r2..3 with gentle brightness variance */
+        int depthBand = i & 3;                 /* 0..3 */
+        int radius = 2 + (depthBand >> 1);     /* 2 or 3 */
+        float depthFade = 0.75f + 0.25f * (float)depthBand * 0.33f;
+        s_canvas.addGlowDot(p.x, p.y, st.color, intensity * depthFade, radius);
     }
 }
 
-/* The three RSSI zone rings — soft glow with a slow standing-wave
- * shimmer, brightened just behind the radar sweep. */
-static void render_rings(float sweepAngle, float gain)
+/* The three RSSI zone rings — CONNECTED GLOWING BANDS (the
+ * spectrograph treatment from 77720d1): closed polylines drawn as
+ * bright core addLine segments + soft glow dots at every Nth vertex.
+ * Each ring carries a slow standing-wave shimmer (3..5 petals that
+ * breathe), so the bands read as smooth luminous circles, not thin
+ * dotted lines. LUT trig — the S3 has no FPU. */
+static void render_dome_rings(float gain)
 {
-    static const int kDots[3] = { 100, 160, 208 };
+    static const int   kRingN[3]    = { 36, 48, 56 };
+    static const float kLobes[3]    = { 3.0f, 4.0f, 5.0f };
+    static const float kRingBaseI[3] = { 0.16f, 0.13f, 0.10f };
+    float *sx = s_domeRingScratch[0], *sy = s_domeRingScratch[1], *si = s_domeRingScratch[2];
+    float lphase = s_time * 0.006f;   /* slow standing-wave drift */
     for (int k = 0; k < 3; k++) {
         float r = kRingR[k];
-        float baseI = (0.13f - k * 0.015f) * gain;
-        for (int i = 0; i < kDots[k]; i++) {
-            float a = (float)i / kDots[k] * 6.2831853f;
-            float shimmer = 0.72f + 0.28f *
-                           sinf(a * 3.0f + s_time * 0.021f + k * 1.7f);
-            float intensity = baseI * shimmer;
-            /* sweep proximity boost */
-            float da = sweepAngle - a;
-            while (da > 3.14159f) da -= 6.28318f;
-            while (da < -3.14159f) da += 6.28318f;
-            if (da > -0.9f && da < 0.9f) {
-                intensity *= 1.0f + 0.45f * (1.0f - fabsf(da) / 0.9f);
-            }
-            s_canvas.addGlowDot(kCenterX + cosf(a) * r,
-                                kCenterY + sinf(a) * r,
-                                kRingColor[k], intensity, 2);
+        float baseI = kRingBaseI[k] * gain;
+        if (baseI <= 0.004f) continue;
+        int N = kRingN[k];
+        for (int i = 0; i < N; i++) {
+            float a = (float)i / N * 6.2831853f;
+            /* standing-wave petal modulation — subtle radial breathing */
+            float dr = 1.8f * lut_sin(kLobes[k] * a + lphase + (float)k * 1.7f);
+            float rr = r + dr;
+            /* coherent light-and-shadow envelope along the band */
+            float env = 0.80f + 0.20f * lut_sin(a * 2.0f + s_time * 0.010f + (float)k * 1.9f);
+            si[i] = baseI * env;
+            sx[i] = kCenterX + lut_cos(a) * rr;
+            sy[i] = kCenterY + lut_sin(a) * rr;
         }
+        draw_glow_band(sx, sy, si, N, kRingColor[k], 0.55f, 4);
     }
 }
 
-/* Rotating comet sweep — nested arc segments fading behind the edge. */
-static void render_sweep(float gain)
-{
-    static const float kArcR[4] = { 60.0f, 105.0f, 150.0f, 195.0f };
-    for (int k = 0; k < 4; k++) {
-        float r = kArcR[k];
-        for (float da = 0.0f; da <= 0.85f; da += 0.05f) {
-            float a = s_sweepAngle - da;
-            float fade = 1.0f - da / 0.85f;
-            float intensity = 0.17f * fade * (0.85f - k * 0.10f) * gain;
-            if (intensity <= 0.0f) continue;
-            s_canvas.addGlowDot(kCenterX + cosf(a) * r,
-                                kCenterY + sinf(a) * r,
-                                { 160, 210, 255 }, intensity, 2);
-        }
-        /* bright leading-edge spot */
-        s_canvas.addGlowDot(kCenterX + cosf(s_sweepAngle) * r,
-                            kCenterY + sinf(s_sweepAngle) * r,
-                            { 200, 235, 255 }, 0.30f * gain, 3);
-    }
-}
-
-/* The node itself — a hot white core with a soft breathing halo. */
+/* The node itself — hot white core with a blooming breathing halo.
+ * Three layers: big soft bloom (r16) + mid halo (r8) + crisp hot
+ * core (r3). The bloom gives it a luminous presence without drowning
+ * the nearby device orbs (kept dim). */
 static void render_center(float gain)
 {
-    float pulse = 0.5f + 0.5f * sinf(s_time * 0.052f);
-    s_canvas.addGlowDot(kCenterX, kCenterY, { 165, 205, 255 },
-                        0.26f + 0.14f * pulse, 12);
+    float pulse = 0.5f + 0.5f * lut_sin(s_time * 0.052f);
+    /* big soft bloom — the aura around the node */
+    s_canvas.addGlowDot(kCenterX, kCenterY, { 140, 180, 255 },
+                        (0.18f + 0.10f * pulse) * gain, 16);
+    /* mid halo */
+    s_canvas.addGlowDot(kCenterX, kCenterY, { 180, 215, 255 },
+                        (0.30f + 0.14f * pulse) * gain, 8);
+    /* crisp hot core */
     s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 255, 255 },
-                        0.55f + 0.25f * pulse, 3);
-
+                        (0.60f + 0.25f * pulse) * gain, 3);
 }
 
 /* The orbs: one per device, MAC-stable angle, RSSI-driven radius,
- * class-colored halo + hot core + off-center specular. */
+ * luminous class-colored halo + crisp hot core + off-center specular.
+ * Two glow layers: a soft outer bloom (texture) + a brighter inner
+ * halo so the orb reads as luminous with a crisp identifiable core.
+ * Device class colors preserved. LUT trig. */
 static void render_orbs(face_state_t state, float gain)
 {
     float jitter = (state == FACE_ALERT) ? 2.4f : 0.0f;
@@ -1076,41 +1083,54 @@ static void render_orbs(face_state_t state, float gain)
         if (d.alpha <= 0.01f) continue;
 
         float a = d.baseAngle +
-                  d.driftAmp * sinf(s_time * 0.011f + d.driftPhase);
+                  d.driftAmp * lut_sin(s_time * 0.011f + d.driftPhase);
         float rr = d.radius;
-        float x = kCenterX + cosf(a) * rr;
-        float y = kCenterY + sinf(a) * rr;
+        float x = kCenterX + lut_cos(a) * rr;
+        float y = kCenterY + lut_sin(a) * rr;
         if (jitter > 0.0f) {
             x += rndf(-jitter, jitter);
             y += rndf(-jitter, jitter);
         }
 
         /* slow breathe — near devices pulse a touch faster */
-        float breathe = 1.0f + 0.09f * sinf(s_time * 0.045f + d.pulsePhase);
+        float breathe = 1.0f + 0.09f * lut_sin(s_time * 0.045f + d.pulsePhase);
         /* closer devices read slightly larger */
         float closeness = 1.0f + (DOME_RAD_MAX - rr) / DOME_RAD_MAX * 0.35f;
 
-        int haloR = (int)((8 + d.sizeClass * 2) * breathe * closeness * d.alpha);
-        if (haloR < 4) haloR = 4;
+        int haloR = (int)((9 + d.sizeClass * 2) * breathe * closeness * d.alpha);
+        if (haloR < 5) haloR = 5;
         int coreR = 2 + (d.sizeClass >> 1);
         float coreScale = 0.5f + 0.5f * breathe;
 
-        s_canvas.addGlowDot(x, y, d.glow, 0.32f * d.alpha * gain, haloR);
+        /* soft outer bloom — luminous aura (glow as texture) */
+        s_canvas.addGlowDot(x, y, d.glow, 0.22f * d.alpha * gain, haloR);
+        /* brighter inner halo — the identifiable ring */
+        s_canvas.addGlowDot(x, y, d.glow, 0.36f * d.alpha * gain,
+                            (haloR + 2) / 2);
+        /* crisp hot core — brightness for signal */
         s_canvas.addGlowDot(x, y, d.core,
-                            0.90f * d.alpha * gain,
+                            0.92f * d.alpha * gain,
                             (int)(coreR * coreScale) + 1);
         /* off-center specular — makes the orb read as a ball */
         s_canvas.addGlowDot(x - coreR * 0.4f, y - coreR * 0.4f,
-                            { 255, 255, 255 }, 0.45f * d.alpha * gain, 2);
+                            { 255, 255, 255 }, 0.50f * d.alpha * gain, 2);
     }
 }
 
-/* Advance + draw the particle pool (pulse streams, bursts, implosions). */
+/* Advance + draw the particle pool (pulse streams, bursts, implosions).
+ * STREAMS and BURSTS draw connected line trails with comet heads —
+ * the particle stores its previous position so we draw a glowing
+ * addLine segment from prev->current (the trail) plus a bright
+ * addGlowDot at the head (the comet). This replaces single-pixel
+ * point scatter with flowing arcs. LUT trig. */
 static void render_pool(float gain)
 {
     for (int i = 0; i < DOME_POOL_SIZE; i++) {
         DomeParticle &p = s_pool[i];
         if (!p.alive) continue;
+        /* store previous position for trail line */
+        float prevX = p.x, prevY = p.y;
+        bool hadPrev = (p.age > 0.0f);
         p.age += 1.0f;
         p.u += p.speed;
         if (p.u >= 1.0f || p.age > p.life) {
@@ -1126,14 +1146,15 @@ static void render_pool(float gain)
             x = kCenterX + (p.tx - kCenterX) * eu;
             y = kCenterY + (p.ty - kCenterY) * eu;
             /* slight angular scatter so the burst fans out */
-            x += p.px * p.wobAmp * sinf(u * 8.0f + p.wobPhase) * u;
-            y += p.py * p.wobAmp * sinf(u * 8.0f + p.wobPhase) * u;
+            x += p.px * p.wobAmp * lut_sin(u * 8.0f + p.wobPhase) * u;
+            y += p.py * p.wobAmp * lut_sin(u * 8.0f + p.wobPhase) * u;
             intensity = (u < 0.05f) ? u / 0.05f : 1.0f;
             intensity *= 0.82f * (1.0f - 0.65f * u) * gain;  /* merge into orb */
-            /* comet tail */
+            /* comet tail dot */
             float eu2 = dome_ease_out_cubic(u * 0.82f);
-            s_canvas.addGlowDot(kCenterX + (p.tx - kCenterX) * eu2,
-                                kCenterY + (p.ty - kCenterY) * eu2,
+            float tx2 = kCenterX + (p.tx - kCenterX) * eu2;
+            float ty2 = kCenterY + (p.ty - kCenterY) * eu2;
+            s_canvas.addGlowDot(tx2, ty2,
                                 { p.r, p.g, p.b }, intensity * 0.45f,
                                 p.radius > 1 ? p.radius - 1 : 1);
             break;
@@ -1150,8 +1171,8 @@ static void render_pool(float gain)
         default: {  /* DOME_P_STREAM */
             x = kCenterX + (p.tx - kCenterX) * u;
             y = kCenterY + (p.ty - kCenterY) * u;
-            float wob = sinf(u * p.wobFreq * 12.566f + p.wobPhase) *
-                        sinf(u * 3.14159f);   /* envelope: no wobble at ends */
+            float wob = lut_sin(u * p.wobFreq * 12.566f + p.wobPhase) *
+                        lut_sin(u * 3.14159f);   /* envelope: no wobble at ends */
             x += p.px * p.wobAmp * wob;
             y += p.py * p.wobAmp * wob;
             float edge = u * 5.0f;
@@ -1162,6 +1183,17 @@ static void render_pool(float gain)
             break;
         }
         }
+        /* connected trail line from previous position (flowing arc) */
+        if (hadPrev && intensity > 0.02f &&
+            (p.kind == DOME_P_STREAM || p.kind == DOME_P_BURST)) {
+            s_canvas.addLine(prevX, prevY, x, y,
+                             scale8(p.r, intensity * 0.7f),
+                             scale8(p.g, intensity * 0.7f),
+                             scale8(p.b, intensity * 0.7f));
+        }
+        /* store current position for next frame's trail */
+        p.x = x; p.y = y;
+        /* comet head — bright glow dot at current position */
         s_canvas.addGlowDot(x, y, { p.r, p.g, p.b }, intensity, radius);
     }
 }
@@ -1175,9 +1207,9 @@ static void render_wisps(float gain)
     static const int   kWispS[7] = { 16, 20, 14, 22, 17, 19, 15 };
     for (int i = 0; i < 7; i++) {
         float a = kWispA[i] + s_time * 0.004f;
-        float r = kWispR[i] + 6.0f * sinf(s_time * 0.010f + kWispP[i]);
-        float intensity = (0.10f + 0.08f * sinf(s_time * 0.02f + kWispP[i])) * gain;
-        s_canvas.addGlowDot(kCenterX + cosf(a) * r, kCenterY + sinf(a) * r,
+        float r = kWispR[i] + 6.0f * lut_sin(s_time * 0.010f + kWispP[i]);
+        float intensity = (0.10f + 0.08f * lut_sin(s_time * 0.02f + kWispP[i])) * gain;
+        s_canvas.addGlowDot(kCenterX + lut_cos(a) * r, kCenterY + lut_sin(a) * r,
                             { 255, 165, 60 }, intensity, kWispS[i]);
     }
 }
@@ -1189,14 +1221,14 @@ static void render_voice_ring(float energy, float gain)
     float baseI = (0.10f + 0.45f * energy) * gain;
     for (int i = 0; i < 96; i++) {
         float a = (float)i / 96.0f * 6.2831853f;
-        float shimmer = 0.8f + 0.2f * sinf(a * 5.0f + s_time * 0.05f);
-        s_canvas.addGlowDot(kCenterX + cosf(a) * r, kCenterY + sinf(a) * r,
+        float shimmer = 0.8f + 0.2f * lut_sin(a * 5.0f + s_time * 0.05f);
+        s_canvas.addGlowDot(kCenterX + lut_cos(a) * r, kCenterY + lut_sin(a) * r,
                             { 140, 255, 150 }, baseI * shimmer, 2);
     }
     float r2 = r + 16.0f;
     for (int i = 0; i < 64; i++) {
         float a = (float)i / 64.0f * 6.2831853f;
-        s_canvas.addGlowDot(kCenterX + cosf(a) * r2, kCenterY + sinf(a) * r2,
+        s_canvas.addGlowDot(kCenterX + lut_cos(a) * r2, kCenterY + lut_sin(a) * r2,
                             { 140, 255, 150 }, baseI * 0.45f, 1);
     }
 }
@@ -1518,6 +1550,7 @@ static void render_dome(face_state_t state)
 
     const FaceStyle &st = kStyles[state];
     render_dust(st, deviceCount, gain);
+    render_dome_rings(gain);    /* RSSI zone rings — connected glow bands */
     render_pool(gain);          /* streams + bursts + implosions */
     render_orbs(state, gain);
     render_center(gain);
