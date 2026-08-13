@@ -169,6 +169,11 @@ static int postCsiEvent(const CsiQueueEntry &e) {
 
   // Wander/jitter are the latest waveform metrics (best effort snapshot;
   // diagnostics are per-channel state, read from the sense task).
+  // NOTE (verified 2026-08-13): wander is calibration-gated — esp-radar
+  // only computes waveform_wander from templates captured during a
+  // successful train. On noisy channels train_stop fails and wander
+  // reads 0.0 while jitter stays live (0.23..0.95); the UI must not
+  // depend on wander alone (see display_face.cpp csi_energy).
   float wander = 0.0f;
   float jitter = 0.0f;
   esp_wifi_sensing_fsm_channel_diag_t diag = {};

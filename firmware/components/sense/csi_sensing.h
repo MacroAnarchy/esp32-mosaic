@@ -20,6 +20,20 @@
  * (the room should stay static for ~20s). No vitals, no activity
  * classification.
  *
+ * WANDER GATING (verified live 2026-08-13): esp-radar computes
+ * `waveform_wander` ONLY from template waveforms captured during a
+ * successful train. On a noisy channel (cat, neighbor APs, BLE, display)
+ * the background never settles below the component's 0.002 wander
+ * threshold, so train_stop fails ESP_ERR_INVALID_STATE, train_remove
+ * zeroes the templates and wander stays 0.0 — the observed state on the
+ * desk orb (wander=0.0000, train_valid=0 on every gateway row, while
+ * jitter runs 0.23..0.95). Motion (jitter, moved, smooth) needs no
+ * calibration and is always live. Consumers must NOT treat wander==0 as
+ * "no signal": the UI drives visualizations from a combined energy
+ * (max of wander/jitter norms — see display_face.cpp csi_energy) so the
+ * always-live jitter channel keeps the viz alive, and wander contributes
+ * automatically the night a quiet-room train succeeds.
+ *
  * Events are queued (the FSM owns a background task; the callback must be
  * non-blocking) and drained by the sense task, which POSTs one
  * type:"csi" envelope per event to the gateway — reusing the existing

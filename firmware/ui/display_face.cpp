@@ -177,9 +177,11 @@ static csi_mode_t s_csiMode = CSI_MODE_MERGED;
 static float s_csiPulse = 0.0f;   /* 1.0 fresh spike -> 0.0 decayed */
 static bool  s_csiMovedPrev = false;
 
-/* Polar waveform history — the raw wander signal, plotted faithfully.
- * Appended at the ~5Hz cache cadence (sampleId changes); 96 samples =
- * ~19s of live signal. */
+/* Polar waveform history — the combined living energy signal, plotted
+ * faithfully. Appended at the ~5Hz cache cadence (sampleId changes);
+ * 96 samples = ~19s of live signal. Wander alone is calibration-gated
+ * (0.0 on noisy channels), so the buffer holds csi_energy() — the same
+ * drive the rings use — guaranteeing a living trace at all times. */
 #define CSI_WAVE_N 96
 static float s_wave[CSI_WAVE_N];
 static int   s_waveHead = 0;
@@ -190,6 +192,22 @@ static uint32_t s_waveLastId = 0xFFFFFFFFu;
  * live gateway rows) mapped to a 0..1 visual drive. Linear, clamped. */
 static inline float csi_norm_wander(float w) { float v = w * 2.5f; return v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v); }
 static inline float csi_norm_jitter(float j) { float v = j * 1.3f;  return v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v); }
+
+/* Combined living energy — the master visual drive.
+ *
+ * wander is calibration-gated: esp-radar only computes waveform_wander
+ * from templates captured during a successful train, which fails on
+ * noisy channels (verified live: wander=0.0000 train_valid=0 on every
+ * gateway row while jitter runs 0.23..0.95 — see csi_sensing.h). The
+ * viz must therefore drive from BOTH features: whichever is alive wins.
+ * A calm room shows the jitter floor (clear visible structure at rest);
+ * motion pushes the drive bright. */
+static inline float csi_energy(float wander, float jitter)
+{
+    float w = csi_norm_wander(wander);
+    float j = csi_norm_jitter(jitter);
+    return w > j ? w : j;
+}
 
 /* Staleness factor: 1.0 while fresh, decaying to 0.0 once the cache
  * stops updating (~5s) — the CSI viz calms honestly when the radio
@@ -1102,7 +1120,9 @@ static void render_voice_ring(float energy, float gain)
 /* CSI visualization — the radio dome's second sense, rendered live.   */
 /*                                                                     */
 /* Both modes are driven by the sense engine's REAL channel features:  */
-/*   wander  -> shape/amplitude (waveform dynamics)                    */
+/*   energy (max of wander/jitter norms) -> shape/amplitude — the      */
+/*              master drive (see csi_energy: wander alone is          */
+/*              calibration-gated to 0 on noisy channels)              */
 /*   jitter  -> angular motion + sparkle (motion energy)               */
 /*   someone -> warm presence tint + slow breathing-band envelope      */
 /*              (0.2-0.5Hz annotated on top, per the capability map)   */
@@ -1143,9 +1163,10 @@ static void render_csi_ripple(float gain)
 }
 
 /* CSI MERGED: a living membrane around the core — Siri-like morphing
- * ring inside the dome's inner ring. wander morphs its shape, jitter
- * spins + sparkles it, presence opens it warm with a 0.2-0.5Hz breath.
- * Subtle in IDLE, alive when the channel reacts. */
+ * ring inside the dome's inner ring. combined energy morphs its shape,
+ * jitter spins + sparkles it, presence opens it warm with a 0.2-0.5Hz
+ * breath. Clearly visible in IDLE (jitter floor), alive when the
+ * channel reacts. */
 static void render_csi_halo(float gain)
 {
     sense_csi_features_t c;
@@ -1153,17 +1174,18 @@ static void render_csi_halo(float gain)
     float fresh = have ? csi_freshness(c) : 0.0f;
     float wm = have ? csi_norm_wander(c.wander) : 0.0f;
     float jm = have ? csi_norm_jitter(c.jitter) : 0.0f;
+    float en = have ? csi_energy(c.wander, c.jitter) : 0.0f;
     float someone = have && c.someone ? 1.0f : 0.0f;
-    if (fresh <= 0.0f) { wm = 0.0f; jm = 0.0f; someone = 0.0f; }  /* radio quiet/offline: calm */
+    if (fresh <= 0.0f) { wm = 0.0f; jm = 0.0f; en = 0.0f; someone = 0.0f; }  /* radio quiet/offline: calm */
     csi_motion_tick(c, have, fresh);
 
     const int N = 150;
     /* breathing-band annotation (~0.29Hz at 33fps) — the known pattern,
      * scaled by reality: only audible when presence/motion is real. */
     float breath = 0.5f + 0.5f * sinf(s_time * 0.0088f + 1.7f);
-    float baseR = 62.0f + 8.0f * someone * breath;              /* presence opens the halo */
-    float morph = 7.0f + 20.0f * wm;                            /* wander morphs the shape */
-    float rot = s_time * (0.0035f + 0.018f * jm);               /* jitter spins it faster */
+    float baseR = 76.0f + 10.0f * someone * breath;         /* presence opens the halo — big base ring, clearly visible */
+    float morph = 9.0f + 24.0f * en;                        /* combined energy morphs the shape (wander OR jitter) */
+    float rot = s_time * (0.0035f + 0.018f * jm);           /* jitter spins it faster */
     Rgb col = lerpRgb({ 120, 190, 255 }, { 255, 175, 90 }, someone * 0.8f);
 
     for (int i = 0; i < N; i++) {
@@ -1176,7 +1198,10 @@ static void render_csi_halo(float gain)
         if (r > 108.0f) r = 108.0f;   /* stay clear of the dome's inner ring (94) */
         a += jm * 0.06f * sinf(s_time * 0.08f + (float)i * 2.17f);
         float flick = 0.55f + 0.45f * sinf(s_time * 0.10f + (float)i * 1.31f);
-        float intensity = (0.09f + 0.15f * someone + 0.09f * jm * flick + 0.05f * wm) * gain;
+        /* Energy-driven: the halo stays clearly visible at the jitter
+         * floor (calm room) and flares with motion — never hidden by
+         * the wander calibration gate. */
+        float intensity = (0.16f + 0.14f * someone + 0.16f * en * flick + 0.06f * wm) * gain;
         if (intensity <= 0.01f) continue;
         s_canvas.addGlowDot(kCenterX + cosf(a) * r, kCenterY + sinf(a) * r,
                             col, intensity, 2);
@@ -1192,24 +1217,27 @@ static void render_csi_halo(float gain)
 }
 
 /* CSI STANDALONE: full-screen signal anatomy, denser than the dome.
- *   - frequency rings: each ring reads one wander band (multi-scale
- *     EMA) so the channel's waveform dynamics spread from fast (inner)
- *     to slow (outer) rings; aberration waves displace the dots ∝ jitter
- *   - polar waveform: the raw wander signal plotted faithfully over
- *     ~19s of history (5Hz cache samples)
+ *   - frequency rings: each ring reads one ENERGY band (multi-scale
+ *     EMA on the combined wander/jitter drive — wander alone is
+ *     calibration-gated to 0, so the rings would vanish) so the
+ *     channel's living dynamics spread from fast (inner) to slow
+ *     (outer) rings; aberration waves displace the dots ∝ jitter
+ *   - polar waveform: the combined living energy plotted faithfully
+ *     over ~19s of history (5Hz cache samples)
  *   - presence: warm breathing aura + breath-brightened pattern
  *   - motion: expanding ripple + radial sparks from the core
- *   - absence: a quiet room flattens the rings and the waveform — the
- *     stillness IS the absence annotation (no labels needed) */
+ *   - absence: a quiet room rests the rings and the waveform at their
+ *     visible base intensities — the calm IS the absence annotation
+ *     (no labels needed) */
 static void render_csi_standalone(float gain)
 {
     sense_csi_features_t c;
     bool have = sense_engine_get_csi_features(&c);
     float fresh = have ? csi_freshness(c) : 0.0f;
-    float wm = have ? csi_norm_wander(c.wander) : 0.0f;
     float jm = have ? csi_norm_jitter(c.jitter) : 0.0f;
+    float en = have ? csi_energy(c.wander, c.jitter) : 0.0f;
     float someone = have && c.someone ? 1.0f : 0.0f;
-    if (fresh <= 0.0f) { wm = 0.0f; jm = 0.0f; someone = 0.0f; }
+    if (fresh <= 0.0f) { jm = 0.0f; en = 0.0f; someone = 0.0f; }
     csi_motion_tick(c, have, fresh);
 
     /* keep the dome device table + particle pool alive while standalone
@@ -1223,26 +1251,33 @@ static void render_csi_standalone(float gain)
         if (p.u >= 1.0f || p.age > p.life) p.alive = 0;
     }
 
-    /* append fresh waveform samples (one per 5Hz cache tick) */
+    /* append fresh waveform samples (one per 5Hz cache tick) — store the
+     * combined energy (0..1) so the trace is alive even when wander is
+     * calibration-gated at 0 */
     if (have && c.sampleId != s_waveLastId) {
         s_waveLastId = c.sampleId;
-        csi_wave_push(c.wander);
+        csi_wave_push(csi_energy(c.wander, c.jitter));
     }
 
     float breath = 0.5f + 0.5f * sinf(s_time * 0.0088f + 2.3f);   /* 0.2-0.5Hz annotation */
 
-    /* --- frequency rings + aberration waves --- */
+    /* --- frequency rings + aberration waves ---
+     * Each ring reads one ENERGY band (multi-scale EMA on the combined
+     * wander+jitter drive — NOT wander alone: wander is calibration-gated
+     * to 0.0 on noisy channels, so a wander-only drive blanks the rings).
+     * Base intensities are floored well above the additive-glow noise
+     * floor: a calm room shows clear living rings, motion goes bright. */
     static const float kRingR[6] = { 46.0f, 72.0f, 98.0f, 170.0f, 196.0f, 218.0f };
     static const int   kRingN[6] = { 40, 56, 72, 96, 108, 116 };
     static const float kRingRate[6] = { 0.30f, 0.19f, 0.12f, 0.07f, 0.042f, 0.024f };
     static float s_wband[6] = { 0, 0, 0, 0, 0, 0 };
     for (int k = 0; k < 6; k++) {
-        s_wband[k] += (wm - s_wband[k]) * kRingRate[k];
+        s_wband[k] += (en - s_wband[k]) * kRingRate[k];
     }
     for (int k = 0; k < 6; k++) {
         float r = kRingR[k];
         float band = s_wband[k];
-        float baseI = (0.045f + 0.17f * band) * gain;
+        float baseI = (0.14f + 0.34f * band) * gain;
         if (baseI <= 0.004f) continue;
         Rgb col = lerpRgb({ 80, 160, 255 }, { 255, 170, 90 }, someone * 0.75f);
         float sh[8];   /* 8-phase shimmer LUT — one sinf per phase, not per dot */
@@ -1262,17 +1297,20 @@ static void render_csi_standalone(float gain)
         }
     }
 
-    /* --- polar waveform: the raw wander signal, faithfully --- */
+    /* --- polar waveform: the combined living energy, faithfully ---
+     * Buffer holds csi_energy (0..1), scaled to the ACTUAL observed
+     * range: jitter floor ~0.29 (norm ~0.38) already reads as a living
+     * ring; motion pushes it out bright. No *2.5 wander scaling here —
+     * that mapped calibration-gated 0.0 into a pinned dim dot. */
     {
         Rgb wcol = lerpRgb({ 120, 200, 255 }, { 255, 170, 110 }, jm * 0.9f);
         for (int i = 0; i < CSI_WAVE_N; i++) {
             float v = s_wave[(s_waveHead + i) % CSI_WAVE_N];
-            float nv = v * 2.5f;
-            if (nv > 1.0f) nv = 1.0f;
+            float nv = v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v);
             float a = (float)i / CSI_WAVE_N * 6.2831853f + 0.02f * sinf(s_time * 0.005f);
-            float r = 133.0f + (nv - 0.5f) * 34.0f;   /* lane between rings 98 and 170 */
+            float r = 133.0f + (nv - 0.5f) * 50.0f;   /* lane between rings 98 and 170 */
             s_canvas.addGlowDot(kCenterX + cosf(a) * r, kCenterY + sinf(a) * r,
-                                wcol, (0.26f + 0.30f * nv) * gain, 1);
+                                wcol, (0.30f + 0.45f * nv) * gain, 1);
         }
     }
 
