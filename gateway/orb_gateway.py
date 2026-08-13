@@ -197,6 +197,13 @@ CSI_ADDED_COLUMNS = {
     "train_valid": "INTEGER",
     "train_wander_threshold": "REAL",
     "train_jitter_threshold": "REAL",
+    # Phase 2 — breathing-band detection (additive, backward-compatible):
+    #   breathing_energy  = 0..1 normalised power in 0.2-0.5 Hz band
+    #   breathing_rate_hz = peak frequency in band (0.0 when indeterminate)
+    #   breathing_samples = sample count in the analysis window (0..160)
+    "breathing_energy": "REAL",
+    "breathing_rate_hz": "REAL",
+    "breathing_samples": "INTEGER",
 }
 
 
@@ -307,19 +314,23 @@ class DB:
 
         # csi events (+ Phase 1 feature snapshots: presence/calibration
         # columns are additive — NULL on firmware that predates them)
+        # Phase 2: breathing columns additive too.
         if typ == "csi":
             cur.execute(
                 """INSERT INTO csi_events (received_at, node_id, event, someone, moved, wander, jitter,
                        presence_ready, presence_wander_average, presence_someone_threshold,
-                       presence_someone, train_valid, train_wander_threshold, train_jitter_threshold)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       presence_someone, train_valid, train_wander_threshold, train_jitter_threshold,
+                       breathing_energy, breathing_rate_hz, breathing_samples)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (now, node, payload.get("event"), int(payload.get("someone", False)),
                  int(payload.get("moved", False)), payload.get("wander"), payload.get("jitter"),
                  int(payload.get("presence_ready", False)),
                  payload.get("presence_wander_average"), payload.get("presence_someone_threshold"),
                  int(payload.get("presence_someone", False)),
                  int(payload.get("train_valid", False)),
-                 payload.get("train_wander_threshold"), payload.get("train_jitter_threshold")),
+                 payload.get("train_wander_threshold"), payload.get("train_jitter_threshold"),
+                 payload.get("breathing_energy"), payload.get("breathing_rate_hz"),
+                 payload.get("breathing_samples")),
             )
 
         self.conn.commit()
