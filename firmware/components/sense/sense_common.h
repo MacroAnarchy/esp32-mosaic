@@ -26,12 +26,13 @@ inline void mac_to_str(const uint8_t mac[6], char *out, size_t out_len) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// Gateway /ingest URL from config.h's MOSAIC_GATEWAY_HOST/PORT. Requires
+// Gateway /orb/ingest URL from config.h's MOSAIC_GATEWAY_HOST/PORT. Requires
 // config.h to be included first (same convention as the rest of the
-// component).
+// component). NOTE: the gateway (orb_gateway.py) serves POST /orb/ingest —
+// plain /ingest returns 404 (orb-01 outage 2026-08-13, fixed).
 inline std::string gateway_ingest_url() {
   return std::string("http://") + MOSAIC_GATEWAY_HOST + ":" +
-         std::to_string(MOSAIC_GATEWAY_PORT) + "/ingest";
+         std::to_string(MOSAIC_GATEWAY_PORT) + "/orb/ingest";
 }
 
 // POST a JSON body to url (Mosaic protocol v1 envelope). Returns the HTTP

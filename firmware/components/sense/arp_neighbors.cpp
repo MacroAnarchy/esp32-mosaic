@@ -60,7 +60,7 @@ static void arpPostEvent(const char *type, const uint8_t *mac, const char *ip,
   sense_wifi_get_ap_bssid(bssid, sizeof(bssid));
 
   std::string url = std::string("http://") + MOSAIC_GATEWAY_HOST + ":" +
-                    std::to_string(MOSAIC_GATEWAY_PORT) + "/ingest";
+                    std::to_string(MOSAIC_GATEWAY_PORT) + "/orb/ingest";
   std::string payload = std::string("{\"v\":1,\"node\":\"") + MOSAIC_NODE_NAME +
                         "\",\"type\":\"" + type + "\",\"ts\":" +
                         std::to_string(sense::uptime_ms()) +

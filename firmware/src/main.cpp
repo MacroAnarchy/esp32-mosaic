@@ -436,7 +436,7 @@ static void runWifiScanCycle() {
   // 5) Report the batch envelope (only if back online and frames captured)
   if (joined && g_wifiFrameCount > 0) {
     HTTPClient http;
-    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/ingest";
+    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
     String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) +
                      "\",\"type\":\"wifi\",\"ts\":" + String(millis()) +
                      ",\"payload\":{\"frames\":[";
@@ -506,7 +506,7 @@ void loop() {
   // Report to gateway — Mosaic protocol v1 envelope with real BSSID
   if (count > 0 && WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/ingest";
+    String url = String("http://") + gatewayHost + ":" + gatewayPort + "/orb/ingest";
     String bssid = WiFi.BSSIDstr();
     String payload = "{\"v\":1,\"node\":\"" + String(MOSAIC_NODE_NAME) +
                      "\",\"type\":\"scan\",\"ts\":" + String(millis()) +
