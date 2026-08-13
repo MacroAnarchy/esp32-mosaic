@@ -53,6 +53,15 @@ extern "C" {
 #define MOSAIC_CSI_ENABLE 1
 #endif
 
+/* Live UI feature snapshot (struct declared in sense_engine.h — the
+ * face layer's data seam). The CSI module keeps a ~5Hz cache of the
+ * sensing FSM's channel diagnostics, refreshed by an esp_timer (a cheap
+ * read — no HTTP, no radio-path writes), and this getter copies it out
+ * for the render task. Returns false when CSI is disabled or no sample
+ * has been cached yet. */
+struct sense_csi_features;
+bool csi_sensing_get_ui_features(struct sense_csi_features *out);
+
 /* Create the sensing FSM with one channel (the AP BSSID) and start
  * processing. Requires the STA association (for the AP BSSID and the
  * gateway used by ping-assisted sampling). Safe to call once; returns

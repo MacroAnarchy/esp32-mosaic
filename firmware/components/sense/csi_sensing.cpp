@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_sensing.h"
 #include "freertos/FreeRTOS.h"
@@ -275,6 +276,61 @@ static void csiFeatureTick(void) {
   postCsiFeature();
 }
 
+// ---------------------------------------------------------------------
+// UI feature cache — the face renderer's live data seam.
+//
+// The dome visualization is driven by the REAL channel features
+// (wander / jitter / presence / motion), so the UI needs a fresh
+// snapshot more often than the ~15s gateway feature cadence. A 5Hz
+// esp_timer reads the FSM's channel diagnostics (a cheap public read —
+// no HTTP, no radio-path writes; the zombie-STA rule only forbids
+// concurrent POSTing tasks) into a tiny spinlock-guarded cache. The
+// render task never touches the FSM or the component API.
+// ---------------------------------------------------------------------
+#define CSI_UI_SAMPLE_MS 200  // 5Hz — live enough for the halo, ~nothing on CPU
+
+static sense_csi_features_t s_csiUi = {};
+static portMUX_TYPE s_csiUiLock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_csiUiSampleId = 0;
+static esp_timer_handle_t s_uiTimer = NULL;
+
+static void csiUiTick(void *arg) {
+  (void)arg;
+  if (!s_fsm || !s_running) return;  // paused (offline scan): keep last sample
+  esp_wifi_sensing_fsm_channel_diag_t diag = {};
+  if (esp_wifi_sensing_fsm_get_channel_diag(s_fsm, s_peerMac, &diag) != ESP_OK) return;
+  sense_csi_features_t f;
+  f.wander = diag.wander_value;
+  f.jitter = diag.jitter_value;
+  f.smooth = (float)diag.smooth_scaled;
+  f.someone = diag.presence_someone_status;
+  f.moved = (diag.state == ESP_WIFI_SENSING_FSM_PROCESS_ACTIVE ||
+             diag.state == ESP_WIFI_SENSING_FSM_PROCESS_DEBOUNCE_ACTIVE);
+  f.presenceReady = diag.presence_ready;
+  f.trainValid = diag.train_thresholds_valid;
+  f.updatedMs = sense::uptime_ms();
+  f.sampleId = ++s_csiUiSampleId;
+  portENTER_CRITICAL(&s_csiUiLock);
+  s_csiUi = f;
+  portEXIT_CRITICAL(&s_csiUiLock);
+}
+
+static void csiUiTimerStart(void) {
+  if (s_uiTimer) return;
+  const esp_timer_create_args_t targs = {
+      .callback = csiUiTick,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "csi_ui",
+      .skip_unhandled_events = true,
+  };
+  if (esp_timer_create(&targs, &s_uiTimer) != ESP_OK) {
+    ESP_LOGW(TAG, "UI feature timer create failed — dome renders without CSI");
+    return;
+  }
+  esp_timer_start_periodic(s_uiTimer, CSI_UI_SAMPLE_MS * 1000ULL);
+}
+
 // Close the boot-time DEBUG window (see csi_sensing_init) without needing
 // a task: a one-shot esp_timer restores INFO ~5s after init.
 static void closeDebugWindow(void *arg) {
@@ -378,6 +434,11 @@ esp_err_t csi_sensing_init(void) {
   if (esp_timer_create(&targs, &t) == ESP_OK) {
     esp_timer_start_once(t, 5000 * 1000ULL);  // 5s
   }
+
+  // Live UI feature cache for the face renderer (5Hz diag sampling —
+  // see csiUiTick above).
+  csiUiTimerStart();
+
   return ESP_OK;
 }
 
@@ -438,4 +499,16 @@ int csi_sensing_drain_and_report(void) {
     csiFeatureTick();
   }
   return posted;
+}
+
+// ---------------------------------------------------------------------
+// UI feature getter (declared in sense_engine.h — the face layer's data
+// seam). Copies the ~5Hz diag cache out for the render task.
+// ---------------------------------------------------------------------
+bool csi_sensing_get_ui_features(struct sense_csi_features *out) {
+  if (out == NULL) return false;
+  portENTER_CRITICAL(&s_csiUiLock);
+  *out = s_csiUi;
+  portEXIT_CRITICAL(&s_csiUiLock);
+  return out->sampleId > 0;
 }

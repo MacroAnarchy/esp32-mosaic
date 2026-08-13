@@ -676,6 +676,11 @@ int sense_engine_get_devices(sense_device_t *out, int max_records)
   return n;
 }
 
+bool sense_engine_get_csi_features(sense_csi_features_t *out)
+{
+  return csi_sensing_get_ui_features(out);
+}
+
 // =====================================================================
 // Sense task — the loop the Arduino build ran in loop(), now a FreeRTOS
 // task so the face render loop keeps running alongside it.

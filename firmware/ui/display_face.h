@@ -54,6 +54,23 @@ void display_face_set_voice_energy(float energy);
 /* Pause/resume rendering (e.g. before deep sleep). */
 esp_err_t display_face_set_suspended(bool suspended);
 
+/* CSI visualization modes — the face renders the radio dome plus a
+ * live CSI layer driven by the sense engine's real channel features
+ * (wander / jitter / presence / motion). */
+typedef enum {
+    CSI_MODE_OFF = 0,      /* plain radio dome (pre-CSI behavior)     */
+    CSI_MODE_MERGED,       /* dome + Siri-like morphing halo around the core */
+    CSI_MODE_STANDALONE,   /* full-screen signal anatomy (frequency rings,
+                            * polar waveform, aberration waves)        */
+    CSI_MODE_COUNT
+} csi_mode_t;
+
+/* Pin the CSI visualization mode: -1 = auto-cycle (default: every
+ * ~30s, merged -> standalone -> off -> ...), 0..2 = pinned. Thread-safe. */
+esp_err_t display_face_set_csi_mode(int mode);
+
+csi_mode_t display_face_get_csi_mode(void);
+
 #ifdef __cplusplus
 }
 #endif
