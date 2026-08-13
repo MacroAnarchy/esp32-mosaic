@@ -73,21 +73,13 @@ static const uint8_t* stamp_for(int r)
 
 /* --------------------------------- Canvas -------------------------------- */
 
-bool GlowCanvas::init(uint16_t* fb, size_t fb_bytes, FlushFn flush, void* flush_ctx)
+bool GlowCanvas::init(uint16_t** rows, FlushFn flush, void* flush_ctx)
 {
-    const size_t need = (size_t)kScreenW * kScreenH * sizeof(uint16_t);
-    if (fb != nullptr) {
-        if (fb_bytes < need) {
-            return false;
-        }
-        _fb     = fb;
-        _owns_fb = false;
-    } else {
-        _fb      = (uint16_t*)std::malloc(need);
-        _owns_fb = _fb != nullptr;
-        if (_fb == nullptr) {
-            return false;
-        }
+    if (rows == nullptr) {
+        return false;
+    }
+    for (int y = 0; y < kScreenH; y++) {
+        _rows[y] = rows[y];
     }
     _flush      = flush;
     _flush_ctx  = flush_ctx;
@@ -100,26 +92,21 @@ bool GlowCanvas::init(uint16_t* fb, size_t fb_bytes, FlushFn flush, void* flush_
 
 void GlowCanvas::deinit()
 {
-    if (_owns_fb && _fb != nullptr) {
-        std::free(_fb);
+    for (int y = 0; y < kScreenH; y++) {
+        _rows[y] = nullptr;
     }
-    _fb        = nullptr;
-    _owns_fb   = false;
-    _flush     = nullptr;
-    _flush_ctx = nullptr;
-    _n_dirty   = 0;
-    _n_segs    = 0;
-}
-
-void GlowCanvas::fb_free(uint16_t* fb)
-{
-    std::free(fb);
+    _flush      = nullptr;
+    _flush_ctx  = nullptr;
+    _n_dirty    = 0;
+    _n_segs     = 0;
 }
 
 void GlowCanvas::clear()
 {
-    if (_fb != nullptr) {
-        std::memset(_fb, 0, (size_t)kScreenW * kScreenH * sizeof(uint16_t));
+    for (int y = 0; y < kScreenH; y++) {
+        if (_rows[y] != nullptr) {
+            std::memset(_rows[y], 0, (size_t)kScreenW * sizeof(uint16_t));
+        }
     }
 }
 
@@ -161,7 +148,7 @@ void GlowCanvas::beginFrame()
     for (int i = 0; i < _n_dirty; i++) {
         const Rect& r = _dirty[i];
         for (int y = r.y; y < r.y + r.h; y++) {
-            std::memset(_fb + (size_t)y * kScreenW + r.x, 0, (size_t)r.w * sizeof(uint16_t));
+            std::memset(_rows[y] + r.x, 0, (size_t)r.w * sizeof(uint16_t));
         }
     }
     _n_dirty = 0;
@@ -176,7 +163,7 @@ void GlowCanvas::beginFrame()
         int guard    = 1200;
         while (guard--) {
             if ((unsigned)x0 < (unsigned)kScreenW && (unsigned)y0 < (unsigned)kScreenH) {
-                _fb[(size_t)y0 * kScreenW + x0] = 0;
+                _rows[y0][x0] = 0;
             }
             if (x0 == x1 && y0 == y1) {
                 break;
@@ -197,8 +184,8 @@ void GlowCanvas::beginFrame()
 
 void GlowCanvas::push()
 {
-    if (_flush != nullptr && _fb != nullptr) {
-        _flush(_flush_ctx, _fb);
+    if (_flush != nullptr) {
+        _flush(_flush_ctx);
     }
 }
 
@@ -229,7 +216,7 @@ void GlowCanvas::addGlowDot(float fx_, float fy_, const Rgb& color, float intens
             s += side;
             continue;
         }
-        uint16_t* row = _fb + (size_t)y * kScreenW;
+        uint16_t* row = _rows[y];
         for (int dx = 0; dx < side; dx++) {
             const int w = *s++;
             if (w == 0) {

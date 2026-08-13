@@ -117,6 +117,6 @@ direct_dependencies:
 - espressif/cmake_utilities
 - espressif/esp_wifi_sensing
 - idf
-manifest_hash: 7af998d9e751ca5d0b219654d47a7e9768479659b3e36b49e677af234834c774
+manifest_hash: 93c685cefda69c17455ae9824a9825df2108fd4bbbae832f9136c7ed9eb004de
 target: esp32s3
 version: 2.0.0
