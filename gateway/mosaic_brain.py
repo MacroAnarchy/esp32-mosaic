@@ -381,6 +381,53 @@ def device_stats(c, hours=24):
     return rows
 
 
+def _collapse_named_products(rows):
+    """Collapse rows sharing a broadcast name into one product row.
+
+    BLE devices (earbuds, headphones) rotate their MAC address for privacy.
+    A single physical product produces 5-15 rows — one per rotating MAC.
+    This collapses them: the strongest avg-RSSI MAC is the representative;
+    aggregated stats (total n, widest spread, latest last_seen) summarize
+    the whole product. Seeded identities and findmy auto-labels are never
+    collapsed (they are the identity anchor / distinct namespace).
+
+    This is the pragmatic name-collapse fix for the rotating-MAC labeling
+    issue (WF-C510, Px7 S3, MOMENTUM 4, etc.). The structural graph-based
+    solution (Louvain co-occurrence, per research 04:29) is the full
+    upgrade path; this handles the 90% case cleanly today.
+    """
+    by_name = {}
+    ungrouped = []
+    for r in rows:
+        bn = r.get("broadcast_name")
+        if bn and not r.get("seed") and not r.get("stable"):
+            by_name.setdefault(bn, []).append(r)
+        else:
+            r["n_macs"] = 1
+            ungrouped.append(r)
+
+    out = []
+    for name, group in by_name.items():
+        if len(group) == 1:
+            group[0]["n_macs"] = 1
+            out.append(group[0])
+            continue
+        # Representative: strongest avg RSSI, most sightings as tiebreak.
+        rep = max(group, key=lambda r: (r["avg"], r["n"]))
+        rep = dict(rep)
+        # Aggregate: total sightings, widest spread (the product's true
+        # movement envelope across all its MACs), latest last_seen.
+        rep["n"] = sum(r["n"] for r in group)
+        rep["spread"] = max(r["spread"] for r in group)
+        rep["spread_raw"] = max(r["spread_raw"] for r in group)
+        rep["n_macs"] = len(group)
+        rep["label"] = name
+        out.append(rep)
+
+    out.extend(ungrouped)
+    return out
+
+
 def entity_view(c, hours=24):
     """The entity picture: devices → labels → movement class."""
     ensure_schema(c)
@@ -394,6 +441,8 @@ def entity_view(c, hours=24):
         lbl = labels.get(mac)
         label = lbl["label"] if lbl and lbl["label"] else (s["name"] or mac[:8])
         stable = bool(lbl["stable"]) if lbl else False
+        broadcast_name = (s["name"].strip() if s["name"] and dclass != "findmy"
+                          else None)
 
         # Movement class from RSSI spread (the data's own detector)
         if s["spread"] <= STATIONARY_MAX_SPREAD:
@@ -443,7 +492,13 @@ def entity_view(c, hours=24):
             "dclass": dclass or "-",
             "place_candidate": dclass == "findmy" and move_class == "STATIC",
             "known": known, "tier": tier,
+            "broadcast_name": broadcast_name,
+            "seed": bool(lbl and lbl["label"]),
         })
+
+    # Collapse rotating-MAC products: MACs sharing a broadcast name (and
+    # not seeded) merge into one row. Representative = strongest avg RSSI.
+    rows = _collapse_named_products(rows)
 
     # The old sort (spread desc, from device_stats) let unknown rotating MACs
     # bury the labeled anchors — the opposite of what an operator checking
@@ -459,17 +514,22 @@ def print_entity_view(rows, limit=40):
     if not rows:
         print("No data in window (need >=3 sightings per device).")
         return
-    print(f"{'LABEL':<26} {'class':<7} {'dclass':<9} {'avg':>5} {'spr':>4} {'raw':>4} {'n':>5}  mac")
-    print("-" * 96)
+    print(f"{'LABEL':<26} {'class':<7} {'dclass':<9} {'avg':>5} {'spr':>4} {'raw':>4} {'n':>5} {'macs':>4}  mac")
+    print("-" * 102)
     for r in rows[:limit]:
         mark = "MUTED" if r["muted"] else ""
         stable_m = "*" if r["stable"] else " "
         pc = "PLACE?" if r["place_candidate"] else ""
-        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['spread_raw']:>4} {r['n']:>5}  {r['mac']} {mark} {pc}")
+        nmacs = r.get("n_macs", 1)
+        nmacs_s = f"{nmacs}" if nmacs > 1 else " "
+        print(f"{stable_m}{r['label'][:25]:<25} {r['class']:<7} {r['dclass']:<9} {r['avg']:>5} {r['spread']:>4} {r['spread_raw']:>4} {r['n']:>5} {nmacs_s:>4}  {r['mac']} {mark} {pc}")
     tiers = ("KNOWN", "MOVING", "STATIC", "AMBI")
     counts = {t: sum(1 for r in rows if r["tier"] == i) for i, t in enumerate(tiers)}
     summary = " · ".join(f"{t}={counts[t]}" for t in tiers)
-    print(f"  {summary}  (of {len(rows)} devices; spr = robust p10-p90 spread, raw = max-min)")
+    collapsed = sum(1 for r in rows if r.get("n_macs", 1) > 1)
+    total_macs = sum(r.get("n_macs", 1) for r in rows)
+    cnote = f" · {collapsed} rotating-MAC products collapsed ({total_macs} MACs → {len(rows)} rows)" if collapsed else ""
+    print(f"  {summary}  (of {len(rows)} device rows; spr = robust p10-p90 spread, raw = max-min){cnote}")
 
 
 def _movement_class(spread):
@@ -489,6 +549,13 @@ def devices_view(c, hours=24):
     findmy-* auto labels are placeholders, not names — rotating AirTag MACs
     stay out of the inventory until someone names the underlying object
     (same rule as entity_view's KNOWN tier).
+
+    ROTATING-MAC PRODUCTS: BLE devices like earbuds/headphones rotate their
+    MAC address (privacy). A single product (e.g. "WF-C510-GFP") produces
+    5-15 rows — one per rotating MAC. This view COLLAPSES MACs sharing a
+    broadcast name into one row: the strongest/most recent MAC is the
+    representative, and n_macs shows the rotation count. Seeded identities
+    (devices table) are always one-row-per-MAC (they are the identity anchor).
 
     Each row: mac, label, dclass, window movement class, window avg/n,
     all-time last_seen, entity chain id (E-rank, same order as --chains),
@@ -545,7 +612,11 @@ def devices_view(c, hours=24):
     except Exception:
         pass
 
-    out = []
+    # --- Collapse rotating-MAC products ---
+    # Build per-MAC rows first (same as before), then group name-reported
+    # rows by their broadcast name. Seeded identities (devices table) are
+    # never collapsed — they are the identity anchor (one row per MAC).
+    raw = []
     for mac in known_macs:
         lbl = labels.get(mac)
         nm = named.get(mac)
@@ -557,20 +628,54 @@ def devices_view(c, hours=24):
             cls = _movement_class(st["spread"])
             avg, n = st["avg_rssi"], st["n"]
         elif seed:
-            # Labeled identity: UNSEEN = zero BLE sightings ever (honest
-            # WiFi-only anchor); STALE = sighted historically, outside the
-            # window (its MAC rotated on — the slot took over, see entity).
             cls = "UNSEEN" if not last_seen.get(mac) else "STALE"
             avg, n = None, None
         else:
             cls, avg, n = "-", None, None
         dclass = (st or {}).get("device_class") or (nm or {}).get("device_class") or "-"
-        out.append({
+        raw.append({
             "mac": mac, "label": label, "dclass": dclass, "class": cls,
             "avg": avg, "n": n, "last_seen": last_seen.get(mac),
             "entity": chain_of.get(mac, "-"),
             "stable": bool(lbl and lbl["stable"]), "seed": seed,
+            "broadcast_name": nm["name"].strip() if nm else None,
         })
+
+    # Group by broadcast name (collapse rotating MACs of one product).
+    # Seeded rows and MACs with no name keep their own row.
+    by_name = {}  # broadcast_name → [list of row dicts]
+    ungrouped = []
+    for r in raw:
+        bn = r["broadcast_name"]
+        if bn and not r["seed"]:
+            by_name.setdefault(bn, []).append(r)
+        else:
+            ungrouped.append(r)
+
+    # Collapse each name group into one representative row.
+    # Representative = strongest avg RSSI (closest = best signal = the MAC
+    # most likely to be seen). n = total sightings across all MACs.
+    # last_seen = most recent across all MACs. entity = the representative's.
+    out = []
+    for name, group in by_name.items():
+        # Sort: strongest first (avg RSSI closest to 0), most sightings as tiebreak
+        with_stats = [r for r in group if r["avg"] is not None]
+        without_stats = [r for r in group if r["avg"] is None]
+        with_stats.sort(key=lambda r: (r["avg"], -r["n"]))
+        ordered = with_stats + without_stats
+        rep = dict(ordered[0])  # representative row
+        # Aggregate: total n, latest last_seen, MAC count
+        total_n = sum((r["n"] or 0) for r in group)
+        latest_seen = max((r["last_seen"] for r in group
+                          if r["last_seen"]), default=None)
+        rep["n"] = total_n if total_n > 0 else None
+        rep["last_seen"] = latest_seen or rep["last_seen"]
+        rep["n_macs"] = len(group)
+        # Label: keep the broadcast name; the MAC column shows the rep MAC
+        rep["label"] = name
+        out.append(rep)
+
+    out.extend(ungrouped)
     out.sort(key=lambda r: (0 if r["stable"] else 1, r["label"].lower()))
     return out
 
@@ -580,22 +685,29 @@ def print_devices_view(rows, hours=24):
     if not rows:
         print("No known devices (empty devices table and no named broadcasts).")
         return
-    print(f"\nKNOWN DEVICES ({len(rows)} — labeled seeds + device-reported names, "
+    collapsed = sum(1 for r in rows if r.get("n_macs", 1) > 1)
+    total_macs = sum(r.get("n_macs", 1) for r in rows)
+    suffix = (f", {total_macs} MACs → {len(rows)} rows: "
+              f"{collapsed} rotating-MAC products collapsed"
+              if collapsed else "no rotating-MAC products")
+    print(f"\nKNOWN DEVICES ({len(rows)} products from {total_macs} MACs, "
           f"{hours}h window):")
-    print(f"{'LABEL':<24} {'cls':<7} {'dclass':<9} {'avg':>5} {'n':>4} "
-          f"{'last_seen':<23} {'entity':<7}  mac")
-    print("-" * 112)
+    print(f"{'LABEL':<24} {'cls':<7} {'dclass':<9} {'avg':>5} {'n':>5} "
+          f"{'macs':>4} {'last_seen':<23} {'entity':<7}  mac")
+    print("-" * 118)
     for r in rows:
         stable_m = "*" if r["stable"] else " "
-        avg = f"{r['avg']:>5.1f}" if r["avg"] is not None else "    -"
-        n = f"{r['n']:>4}" if r["n"] is not None else "   -"
+        avg = f"{r['avg']:>5.1f}" if r['avg'] is not None else "    -"
+        n = f"{r['n']:>5}" if r['n'] is not None else "    -"
+        nmacs = r.get("n_macs", 1)
+        nmacs_s = f"{nmacs}" if nmacs > 1 else " "
         last = r["last_seen"] or "-"
         print(f"{stable_m}{r['label'][:23]:<23} {r['class']:<7} {r['dclass']:<9} "
-              f"{avg} {n} {last:<23} {r['entity']:<7}  {r['mac']}")
+              f"{avg} {n} {nmacs_s:>4} {last:<23} {r['entity']:<7}  {r['mac']}")
     seeds = sum(1 for r in rows if r["seed"])
     unseen = sum(1 for r in rows if r["class"] == "UNSEEN")
     stale = sum(1 for r in rows if r["class"] == "STALE")
-    print(f"  {len(rows)} known: {seeds} labeled seeds "
+    print(f"  {len(rows)} known products ({total_macs} MACs): {seeds} labeled seeds "
           f"({stale} STALE — outside window, {unseen} never sighted by BLE), "
           f"{len(rows) - seeds} name-reported; "
           f"entity = chain slot id (168h pass, see --chains, largest = E1)")
