@@ -162,12 +162,14 @@ DEFAULT_WM = {
     "owner_cooldown_absent_seconds": 600,
     "owner_cooldown_improve_db": 2.0,
     # Channel health (Aug 11): the --status heartbeat surface. Per-channel
-    # max age before a channel reads STALE (2x = OFFLINE). scan/wifi are
-    # periodic streams (the node scans every ~20s, wifi cycle every few min).
-    # probes are opportunistic (modern phones mostly passive-scan — sparse
-    # is NORMAL). csi is event-driven: a still room produces no events for
-    # hours, so only a 12h+ silence means the channel itself is gone (today
-    # no node sends type:'csi' — the body channel is dead, now VISIBLE).
+    # max age before a channel reads STALE (2x = QUIET/OFFLINE). scan/wifi
+    # are periodic streams (the node scans every ~20s, wifi cycle every few
+    # min). probes are opportunistic (modern phones mostly passive-scan —
+    # sparse is NORMAL): when a node still reports but nothing was heard,
+    # probes reads QUIET, not OFFLINE (silence ≠ broken channel). csi is
+    # event-driven: a still room produces no events for hours, so only a
+    # 12h+ silence means the channel itself is gone (today no node sends
+    # type:'csi' — the body channel is dead, now VISIBLE).
     "channel_scan_max_age_seconds": 600,
     "channel_wifi_max_age_seconds": 900,
     "channel_probes_max_age_seconds": 3600,
@@ -1020,24 +1022,41 @@ def channel_health(c, report=True):
                no events for hours — only a long silence (knob, 12h)
                means the channel itself is gone, e.g. no node sends
                type:'csi')
-    States: LIVE (age <= max) / STALE (<= 2*max) / OFFLINE (> 2*max).
+    States: LIVE (age <= max) / STALE (<= 2*max) / QUIET (> 2*max on a
+    channel whose silence is normal, while a node still reports) /
+    OFFLINE (> 2*max and nothing feeding the channel — the sensor
+    itself stopped talking).
     Also lists known nodes with last contact, so the operator sees WHICH
     sensor stopped talking.
     """
     now = datetime.now(timezone.utc)
+    # node heartbeats first — needed to tell QUIET (pipeline alive,
+    # nothing to hear) from OFFLINE (no node reporting = channel unfed)
+    nodes = []
+    try:
+        for r in c.execute(
+                "SELECT node_id, MAX(last_seen) last_seen FROM nodes "
+                "GROUP BY node_id ORDER BY last_seen DESC"):
+            dt = _parse_ts(r["last_seen"])
+            age = (now - dt).total_seconds() if dt else None
+            nodes.append({"node": r["node_id"], "age_s": age})
+    except Exception:
+        nodes = []
+    feeder_alive = any(n["age_s"] is not None and n["age_s"] <= 7200
+                       for n in nodes)
     channels = [
         ("scan",   "sightings",      "received_at", "channel_scan_max_age_seconds",
-         "periodic stream — node should be reporting every ~20s"),
+         "periodic stream — node should be reporting every ~20s", False),
         ("wifi",   "beacon_samples", "received_at", "channel_wifi_max_age_seconds",
-         "periodic stream — beacon snapshots every few minutes"),
+         "periodic stream — beacon snapshots every few minutes", False),
         ("probes", "probes",         "received_at", "channel_probes_max_age_seconds",
-         "opportunistic: sparse is normal (phones mostly passive-scan)"),
+         "opportunistic: sparse is normal (phones mostly passive-scan)", True),
         ("csi",    "csi_events",     "received_at", "channel_csi_max_age_seconds",
          "event-driven: quiet rooms are normal; OFFLINE = no CSI-capable "
-         "node reporting"),
+         "node reporting", False),
     ]
     out = []
-    for name, table, col, knob, caveat in channels:
+    for name, table, col, knob, caveat, quiet_ok in channels:
         max_age = WM.get(knob, 600)
         try:
             row = c.execute(f"SELECT MAX({col}) v FROM {table}").fetchone()
@@ -1058,30 +1077,23 @@ def channel_health(c, report=True):
             state = "LIVE"
         elif age <= max_age * 2:
             state = "STALE"
+        elif quiet_ok and feeder_alive:
+            state = "QUIET"
         else:
             state = "OFFLINE"
         detail = f"last event {age/3600:.1f}h ago"
         if state == "OFFLINE":
             detail += f" ({caveat})"
+        elif state == "QUIET":
+            detail += " — channel alive, nothing to hear (silence is normal here)"
         out.append({"channel": name, "state": state, "age_s": age, "detail": detail})
-    # node heartbeats — who is still talking at all?
-    nodes = []
-    try:
-        for r in c.execute(
-                "SELECT node_id, MAX(last_seen) last_seen FROM nodes "
-                "GROUP BY node_id ORDER BY last_seen DESC"):
-            dt = _parse_ts(r["last_seen"])
-            age = (now - dt).total_seconds() if dt else None
-            nodes.append({"node": r["node_id"], "age_s": age})
-    except Exception:
-        nodes = []
     if report:
         print_channel_health(out, nodes)
     return out, nodes
 
 
 def print_channel_health(chans, nodes):
-    print("\nCHANNELS — sensing pipeline heartbeat (LIVE ≤ threshold · STALE ≤ 2× · OFFLINE beyond):")
+    print("\nCHANNELS — sensing pipeline heartbeat (LIVE ≤ threshold · STALE ≤ 2× · QUIET = alive, nothing to hear · OFFLINE = sensor gone):")
     print("-" * 78)
     for ch in chans:
         age = f"{ch['age_s']/3600:6.1f}h" if ch["age_s"] is not None else "     n/a"
@@ -1091,7 +1103,7 @@ def print_channel_health(chans, nodes):
         state = "LIVE" if n["age_s"] is not None and n["age_s"] <= 600 else \
                 ("STALE" if n["age_s"] is not None and n["age_s"] <= 7200 else "GONE")
         print(f"  node {n['node']:<22} {state:<6} last contact {age}")
-    print("  OFFLINE = a sensor that stopped talking — visible instead of silent.")
+    print("  OFFLINE = a sensor that stopped talking — visible instead of silent. QUIET = channel alive, silence is normal.")
 
 
 def collapse_chains(rows, macs=None, min_weight=0.7):

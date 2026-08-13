@@ -131,11 +131,13 @@ world_model:
   owner_cooldown_improve_db: 2.0      # switch only when fit improves > this
 
   # Channel health (the --status / --channels heartbeat): per-channel max
-  # age before a channel reads STALE (2x = OFFLINE). scan/wifi are periodic
+  # age before a channel reads STALE (2x = QUIET/OFFLINE). scan/wifi are periodic
   # streams; probes are opportunistic (modern phones mostly passive-scan —
-  # sparse is NORMAL); csi is event-driven, so a still room stays quiet for
-  # hours and only a 12h+ silence means the channel itself is gone. A dead
-  # sensor is reported explicitly instead of silently absent.
+  # sparse is NORMAL): while a node still reports, a quiet probes channel
+  # reads QUIET, not OFFLINE (silence ≠ broken); csi is event-driven, so a
+  # still room stays quiet for hours and only a 12h+ silence means the
+  # channel itself is gone. A dead sensor is reported explicitly instead of
+  # silently absent.
   channel_scan_max_age_seconds: 600     # BLE scans every ~20s → 10 min dead
   channel_wifi_max_age_seconds: 900     # beacon snapshots every few min
   channel_probes_max_age_seconds: 3600  # probe requests (opportunistic)
