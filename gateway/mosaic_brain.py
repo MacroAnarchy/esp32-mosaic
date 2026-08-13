@@ -843,6 +843,82 @@ def _seed_probe_evidence(c, mac, hours=168):
     return d
 
 
+def _seed_arp_evidence(c, mac, hours=168):
+    """Most recent network-layer (ARP) sighting of a seed MAC.
+
+    The ARP feed (firmware arp_join/arp_leave envelopes, payload carries
+    mac + ip) is the WiFi-join confirmation the M1 resolver has been
+    waiting for: a per-network WiFi MAC appearing as a network member is
+    the strongest identity evidence this pipeline can produce for
+    WiFi-only seeds (the BLE sniffer never sees WiFi MACs). Sampling
+    caveat: node ARP cache expiry churns leave->join pairs within
+    minutes, so the MOST RECENT event's type is the current-membership
+    read. Returns dict(type, received_at, ip, age_h) or None.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(
+        timespec="seconds").replace("T", " ")
+    row = c.execute(
+        """SELECT type, received_at, payload FROM events
+           WHERE type IN ('arp_join','arp_leave')
+             AND json_valid(payload) AND json_extract(payload, '$.mac') = ?
+             AND REPLACE(substr(received_at,1,19),'T',' ') > ?
+           ORDER BY received_at DESC LIMIT 1""", (mac, since)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["ip"] = json.loads(d["payload"]).get("ip")
+    except Exception:
+        d["ip"] = None
+    dt = _parse_ts(d["received_at"])
+    d["age_h"] = ((datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                  if dt else None)
+    return d
+
+
+def _seed_network_evidence(c, mac, hours=168):
+    """Best network-layer evidence for a WiFi-only (BLE-blind) seed.
+
+    Priority (strongest -> weakest): ARP join <=24h = network member now
+    (the join-confirmation the resolver's PROBABLE/UNSEEN wording waits
+    for); directed probe <=24h = transient seek signal (existing PROBED
+    semantics); ARP leave <=24h = was a network member until that
+    capture, not on the network as of it. Older evidence is folded into
+    the UNSEEN annotation so no sighting is ever lost. Returns
+    (state, detail, note); note carries the older-evidence tail.
+    """
+    arp = _seed_arp_evidence(c, mac, hours)
+    probe = _seed_probe_evidence(c, mac, hours)
+    note = ""
+    if arp and arp["age_h"] is not None:
+        ts = arp["received_at"][:19].replace("T", " ")
+        if arp["type"] == "arp_join" and arp["age_h"] <= 24:
+            return ("PRESENT",
+                    f"joined home WiFi at {ts} (ip {arp['ip']}) — "
+                    f"network-layer join-confirmation (ARP feed); BLE "
+                    f"sniffer never sees this MAC", "")
+        note = (f"; ARP: {'joined' if arp['type'] == 'arp_join' else 'left'} "
+                f"home WiFi {arp['age_h']:.1f}h ago (ip {arp['ip']})")
+    if probe and probe["age_h"] is not None:
+        if probe["age_h"] <= 24:
+            return ("PROBED",
+                    f"WiFi radio probed known SSID '{probe['ssid']}' "
+                    f"{probe['age_h']:.1f}h ago @ {probe['rssi']} dBm — "
+                    f"transient join-confirmation (one probe ≠ connected; "
+                    f"BLE sniffer never sees this MAC)", "")
+        note += (f"; last directed probe of known SSID '{probe['ssid']}' "
+                 f"was {probe['age_h']:.1f}h ago @ {probe['rssi']} dBm")
+    if arp and arp["age_h"] is not None and arp["type"] == "arp_leave" \
+            and arp["age_h"] <= 24:
+        ts = arp["received_at"][:19].replace("T", " ")
+        return ("LEFT",
+                f"left home WiFi at {ts} ({arp['age_h']:.1f}h ago) — "
+                f"network-layer departure (ARP feed); was join-confirmed "
+                f"until then, not on the network as of that capture", "")
+    return ("UNSEEN", "never sighted by the BLE sniffer (WiFi-only "
+            "identity — resolve via WiFi-join correlation)", note)
+
+
 def owner_view(c, hours=24, report=True):
     """M1 resolver: owner presence through entity chains."""
     ensure_schema(c)
@@ -872,21 +948,9 @@ def owner_view(c, hours=24, report=True):
         mac = s["mac"]
         row = {"label": s["label"], "seed": mac}
         if macs.get(mac) is None:
-            ev = _seed_probe_evidence(c, mac)
-            if ev and ev["age_h"] is not None and ev["age_h"] <= 24:
-                row["state"] = "PROBED"
-                row["detail"] = (f"WiFi radio probed known SSID '{ev['ssid']}' "
-                                 f"{ev['age_h']:.1f}h ago @ {ev['rssi']} dBm — "
-                                 f"transient join-confirmation (one probe ≠ "
-                                 f"connected; BLE sniffer never sees this MAC)")
-            else:
-                row["state"] = "UNSEEN"
-                row["detail"] = ("never sighted by the BLE sniffer (WiFi-only "
-                                 "identity — resolve via WiFi-join correlation)")
-                if ev and ev["age_h"] is not None:
-                    row["detail"] += (f"; last directed probe of known SSID "
-                                      f"'{ev['ssid']}' was {ev['age_h']:.1f}h ago "
-                                      f"@ {ev['rssi']} dBm")
+            state, detail, note = _seed_network_evidence(c, mac)
+            row["state"] = state
+            row["detail"] = detail + note
             out.append(row)
             continue
         slot = slot_of.get(mac)
@@ -1002,11 +1066,16 @@ def print_owner_view(out):
             print(f"{'':<24} {'':<10} └ candidate: {r['candidate']}")
         if r.get("candidate_note"):
             print(f"{'':<24} {'':<10} └ note: {r['candidate_note']}")
-    print("  PRESENT = slot active ≤ 10min · PROBABLE = slot stale but a strong "
+    print("  PRESENT = BLE slot active ≤ 10min, or WiFi-only seed confirmed "
+          "on the network by the ARP feed (join ≤24h) · "
+          "PROBABLE = slot stale but a strong "
           "owner-shaped device is ACTIVE at seed level now (unbound until "
           "WiFi-join confirmation) · PROBED = WiFi-only seed unseen by BLE but "
           "its radio directed-probed a known SSID <24h ago (transient join "
           "evidence — one probe ≠ connected) · "
+          "LEFT = WiFi-only seed whose most recent network-layer sighting is "
+          "a departure — was join-confirmed until then, not on the network "
+          "as of that capture (ARP feed) · "
           "STALE = no owner-shaped evidence in window · "
           "UNRESOLVED = the only level-matched device is already claimed by "
           "another seed — one device never answers for two identities · "
@@ -1060,7 +1129,7 @@ def channel_health(c, report=True):
         ("probes", "probes",         "received_at", "channel_probes_max_age_seconds",
          "opportunistic: sparse is normal (phones mostly passive-scan)", True),
         ("csi",    "csi_events",     "received_at", "channel_csi_max_age_seconds",
-         "event-driven: quiet rooms are normal; OFFLINE = no CSI-capable "
+         "feature snapshots every ~5s + motion events; OFFLINE = no CSI-capable "
          "node reporting", False),
     ]
     out = []
@@ -2147,20 +2216,8 @@ def where_view(c, label):
                       f"n={q['n']} avg {q['avg']} dB ({q['mn']}..{q['mx']}), "
                       f"zone {zone_of(q['avg'])}")
             elif macs is None or slot_of is None:
-                ev = _seed_probe_evidence(c, d["mac"])
-                if ev and ev["age_h"] is not None and ev["age_h"] <= 24:
-                    print(f"  {d['label']:<24} PROBED — WiFi radio probed known "
-                          f"SSID '{ev['ssid']}' {ev['age_h']:.1f}h ago @ "
-                          f"{ev['rssi']} dBm (transient join-confirmation; "
-                          f"BLE sniffer never sees this MAC)")
-                elif ev and ev["age_h"] is not None:
-                    print(f"  {d['label']:<24} UNSEEN — seed {d['mac']} never "
-                          "sighted by the BLE sniffer (WiFi-only identity?); "
-                          f"last directed probe of known SSID '{ev['ssid']}' "
-                          f"was {ev['age_h']:.1f}h ago @ {ev['rssi']} dBm")
-                else:
-                    print(f"  {d['label']:<24} UNSEEN — seed {d['mac']} never "
-                          "sighted by the BLE sniffer (WiFi-only identity?)")
+                state, detail, note = _seed_network_evidence(c, d["mac"])
+                print(f"  {d['label']:<24} {state} — {detail}{note}")
             else:
                 _where_chain_path(d, macs, slot_of, owner_assign, owner_claim)
         return
