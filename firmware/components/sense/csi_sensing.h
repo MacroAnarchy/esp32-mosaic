@@ -1,5 +1,6 @@
 /*
- * csi_sensing: WiFi CSI motion sensing (Tier 1) for the Mosaic sense engine.
+ * csi_sensing: WiFi CSI motion + presence sensing (Tier 1) for the Mosaic
+ * sense engine.
  *
  * Monostatic geometry: the node is an ordinary WiFi STA associated with its
  * home router, and its radio captures Channel State Information from the
@@ -10,15 +11,22 @@
  * connected AP's BSSID (the router). Router ping keeps the sampling path
  * fed with traffic.
  *
- * Scope (Tier 1): motion events only. An ACTIVE transition means radio-
- * visible movement on the channel; INACTIVE means the channel went quiet.
- * No vitals, no activity classification, no verified stationary presence —
- * those are later tiers and are NOT reported.
+ * Scope (Tier 1): motion events (moved/empty) + periodic feature snapshots
+ * (event:"feature", ~5s cadence) carrying presence + waveform metrics.
+ * An ACTIVE transition means radio-visible movement on the channel;
+ * INACTIVE means the channel went quiet. Presence ("presence_someone")
+ * comes from the component's calibrated wander channel — it only becomes
+ * meaningful after the auto-calibration (train) window completes at boot
+ * (the room should stay static for ~20s). No vitals, no activity
+ * classification.
  *
  * Events are queued (the FSM owns a background task; the callback must be
  * non-blocking) and drained by the sense task, which POSTs one
  * type:"csi" envelope per event to the gateway — reusing the existing
- * gateway envelope channel (no new sockets, no UDP).
+ * gateway envelope channel (no new sockets, no UDP). Feature snapshots
+ * are posted from the same sense loop (it cycles at ~20s, comfortably
+ * inside the channel-liveness window) so POSTs never collide with the
+ * BLE scan or the WiFi offline-scan cycle.
  *
  * Radio coexistence: CSI runs on the same STA association as the normal
  * WiFi client (the router-based Espressif examples do exactly this).

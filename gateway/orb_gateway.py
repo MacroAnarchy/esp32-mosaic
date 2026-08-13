@@ -186,6 +186,19 @@ SIGHTINGS_ADDED_COLUMNS = {
     "service_uuids": "TEXT",
 }
 
+# csi_events gained presence + calibration columns with the Phase 1 CSI
+# feature snapshots (event:"feature" envelopes carry them; the csi channel
+# heartbeat only needs received_at, these feed the anomaly engine).
+CSI_ADDED_COLUMNS = {
+    "presence_ready": "INTEGER",
+    "presence_wander_average": "REAL",
+    "presence_someone_threshold": "REAL",
+    "presence_someone": "INTEGER",
+    "train_valid": "INTEGER",
+    "train_wander_threshold": "REAL",
+    "train_jitter_threshold": "REAL",
+}
+
 
 class DB:
     def __init__(self, path):
@@ -200,6 +213,10 @@ class DB:
         for name, decl in SIGHTINGS_ADDED_COLUMNS.items():
             if name not in cols:
                 self.conn.execute(f"ALTER TABLE sightings ADD COLUMN {name} {decl}")
+        csi_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(csi_events)")}
+        for name, decl in CSI_ADDED_COLUMNS.items():
+            if name not in csi_cols:
+                self.conn.execute(f"ALTER TABLE csi_events ADD COLUMN {name} {decl}")
 
     def record(self, rec):
         """Store one stamped envelope."""
@@ -288,13 +305,21 @@ class DB:
                          fr.get("channel"), fr.get("rssi")),
                     )
 
-        # csi events
+        # csi events (+ Phase 1 feature snapshots: presence/calibration
+        # columns are additive — NULL on firmware that predates them)
         if typ == "csi":
             cur.execute(
-                """INSERT INTO csi_events (received_at, node_id, event, someone, moved, wander, jitter)
-                   VALUES (?,?,?,?,?,?,?)""",
+                """INSERT INTO csi_events (received_at, node_id, event, someone, moved, wander, jitter,
+                       presence_ready, presence_wander_average, presence_someone_threshold,
+                       presence_someone, train_valid, train_wander_threshold, train_jitter_threshold)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (now, node, payload.get("event"), int(payload.get("someone", False)),
-                 int(payload.get("moved", False)), payload.get("wander"), payload.get("jitter")),
+                 int(payload.get("moved", False)), payload.get("wander"), payload.get("jitter"),
+                 int(payload.get("presence_ready", False)),
+                 payload.get("presence_wander_average"), payload.get("presence_someone_threshold"),
+                 int(payload.get("presence_someone", False)),
+                 int(payload.get("train_valid", False)),
+                 payload.get("train_wander_threshold"), payload.get("train_jitter_threshold")),
             )
 
         self.conn.commit()

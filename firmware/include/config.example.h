@@ -100,11 +100,13 @@
 // listening to its home AP, no dedicated transmitter). The Espressif
 // esp_wifi_sensing component (Apache-2.0) turns the CSI stream into
 // motion start/stop events, reported as type:"csi" envelopes. Tier 1
-// scope: MOTION ONLY (moved/empty events). No vitals, no activity
-// classification, no verified stationary presence — those are later
-// tiers. The Arduino [env:esp32] build does not compile this (CSI is
-// ESP-IDF only). See docs/protocol.md ("csi") and
-// firmware/components/sense/csi_sensing.cpp.
+// scope: motion events (moved/empty) + periodic feature snapshots
+// (event:"feature", presence + waveform metrics) that keep the gateway
+// csi channel LIVE in quiet rooms. Presence becomes meaningful after the
+// auto-calibration window at boot (~20s, room should stay static).
+// No vitals, no activity classification. The Arduino [env:esp32] build
+// does not compile this (CSI is ESP-IDF only). See docs/protocol.md
+// ("csi") and firmware/components/sense/csi_sensing.cpp.
 
 // Enable WiFi CSI motion sensing on the [env:ui] firmware.
 #define MOSAIC_CSI_ENABLE 1
@@ -117,3 +119,19 @@
 // Motion sensitivity, x1000 scale (1..1000; component default 500 = 0.5).
 // Larger = more sensitive = more false-positive motion events.
 #define MOSAIC_CSI_SENSITIVITY 500
+
+// Periodic feature snapshot cadence (seconds). Each snapshot POSTs one
+// type:"csi" envelope with event:"feature" + presence/wander/jitter.
+// Posted from the sense loop (~20s cycle), so the effective cadence is
+// the loop period; ~10-20 B/s — far under the ~200 B/s features budget.
+#define MOSAIC_CSI_FEATURE_INTERVAL_SECONDS 15
+
+// Presence calibration window (ms). At boot the node trains the
+// component's presence thresholds over a static room; keep the room
+// (and the cat) still for this long after boot for a clean baseline.
+#define MOSAIC_CSI_TRAIN_DURATION_MS 20000
+
+// One-time presence calibration at boot (best effort: retries, gives up
+// after 3 attempts). Motion detection works without it; set 0 to skip
+// calibration (presence then reports not-ready).
+#define MOSAIC_CSI_TRAIN_ENABLE 1
