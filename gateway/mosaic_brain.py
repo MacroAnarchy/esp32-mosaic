@@ -963,6 +963,60 @@ def _stabilized_assign(pending, cache, macs, now):
     return assigned, claimed_by, new_cache
 
 
+def _resolve_owner_prefix(c):
+    """Resolve the owner-label prefix, auto-detecting when the configured
+    prefix matches zero seeds but seeds exist.
+
+    The local config.yaml (gitignored) sets the real prefix for each
+    deployment. If it's missing or stale (e.g., lost during a branch
+    switch), the DEFAULT_WM fallback 'OWNER_' may not match the actual
+    seed labels. Rather than silently breaking M1 (the product's headline
+    question), auto-detect: if the configured prefix matches zero device
+    labels but the devices table has labels with a shared uppercase prefix
+    ending in '_', use that instead. This makes the owner resolver
+    resilient to the exact failure that broke M1 when config.yaml was lost.
+
+    Returns (prefix, auto_detected: bool).
+    """
+    configured = WM.get("owner_label_prefix", "OWNER_")
+    count = c.execute(
+        "SELECT COUNT(*) FROM devices WHERE label LIKE ?",
+        (configured + "%",)
+    ).fetchone()[0]
+    if count > 0:
+        return configured, False
+
+    # Configured prefix matches nothing — try to auto-detect from actual
+    # seed labels. Look for labels sharing an uppercase prefix ending in '_'.
+    rows = c.execute(
+        "SELECT DISTINCT label FROM devices "
+        "WHERE label IS NOT NULL AND label != '' ORDER BY label"
+    ).fetchall()
+    if not rows:
+        return configured, False  # no seeds at all — genuine empty state
+
+    labels = [r["label"] for r in rows]
+    # Find the longest common prefix among all labels.
+    common = os.path.commonprefix(labels)
+    # Trim to the last '_' so we get a clean namespace boundary
+    # (e.g., 'TIGER_IPHONE' → 'TIGER_', not 'TIGER_I').
+    if "_" in common:
+        common = common[: common.rfind("_") + 1]
+    else:
+        common = ""
+
+    # Only accept if the detected prefix is reasonable (2-20 chars,
+    # uppercase + underscore) and matches at least 2 labels.
+    if (common and 2 <= len(common) <= 20
+            and common.replace("_", "").isupper()
+            and common.endswith("_")):
+        matched = sum(1 for l in labels if l.startswith(common))
+        if matched >= 2:
+            return common, True
+
+    return configured, False
+
+
 def _seed_probe_evidence(c, mac, hours=168):
     """Most recent DIRECTED probe-request sighting of a seed MAC.
 
@@ -1072,7 +1126,7 @@ def _seed_network_evidence(c, mac, hours=168):
 def owner_view(c, hours=24, report=True):
     """M1 resolver: owner presence through entity chains."""
     ensure_schema(c)
-    prefix = WM.get("owner_label_prefix", "OWNER_")
+    prefix, auto = _resolve_owner_prefix(c)
     seeds = [dict(r) for r in c.execute(
         "SELECT mac, label, note FROM devices WHERE label LIKE ? ORDER BY label",
         (prefix + "%",))]
@@ -1081,6 +1135,10 @@ def owner_view(c, hours=24, report=True):
             print(f"OWNER: no seeded owner labels (devices label prefix '{prefix}'). "
                   "Seed via --seed-labels, then labels propagate here.")
         return []
+    if auto and report:
+        print(f"OWNER: auto-detected label prefix '{prefix}' "
+              f"(configured '{WM.get('owner_label_prefix', 'OWNER_')}' "
+              f"matched 0 seeds — add it to config.yaml to silence this).")
     # Resolve against full history: seeds may predate the status window.
     rows, macs = analyze_handoffs(c, 24 * 7, report=False, return_macs=True)
     chains = collapse_chains(rows, macs)
@@ -2215,7 +2273,7 @@ def _owner_assignment(c, macs, slot_of):
     seed MAC -> candidate MAC for seeds that won a claim; claimed_by maps
     candidate MAC -> {"label": ..., "delta": ...}.
     """
-    prefix = WM.get("owner_label_prefix", "OWNER_")
+    prefix, _auto = _resolve_owner_prefix(c)
     seeds = [dict(r) for r in c.execute(
         "SELECT mac, label, note FROM devices WHERE label LIKE ? ORDER BY label",
         (prefix + "%",))]
