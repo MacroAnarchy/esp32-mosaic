@@ -54,9 +54,9 @@ def load_config():
             with open(path) as f:
                 cfg = yaml.safe_load(f) or {}
         except ImportError:
-            print("WARN: PyYAML not installed, using defaults (pip install pyyaml)")
+            log("WARN", "PyYAML not installed, using defaults (pip install pyyaml)")
         except Exception as e:
-            print(f"WARN: config.yaml unreadable ({e}), using defaults")
+            log("WARN", f"config.yaml unreadable ({e}), using defaults")
 
     server = {
         "host": cfg.get("host", HOST),
@@ -74,6 +74,24 @@ def load_config():
     return server, wm, token
 
 VALID_TYPES = {"scan", "csi", "imu", "state", "wifi"}
+
+# How often the gateway writes a heartbeat line to its console log, so a
+# quiet log is provably alive (a silent channel must be distinguishable
+# from a dead logger — the "log frozen for 12h" diagnosability hole).
+HEARTBEAT_SECONDS = 300
+
+
+def log(level, msg):
+    """One timestamped console line, flushed immediately.
+
+    The service unit redirects stdout to the gateway log file; a bare
+    print() block-buffers on a redirected stdout (~4-8KB), so lines can
+    sit invisible for hours and the log looks frozen while the gateway
+    works fine. flush=True makes every line land the moment it happens.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {level:<5} {msg}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # SQLite layer
@@ -344,6 +362,7 @@ class Gateway:
         """Validate, log, store, broadcast. Returns (http_status, body)."""
         rec, err = self.stamp(envelope, source_ip)
         if err:
+            log("WARN", f"ingest {source_ip or '?'} rejected: {err}")
             return 400, {"error": err}
         # Canonical JSONL log (source of truth)
         with open(self.log_file, "a") as f:
@@ -352,13 +371,15 @@ class Gateway:
         try:
             self.db.record(rec)
         except Exception as e:
-            print(f"[db] error: {e}")
+            log("ERROR", f"db write failed: {e}")
         # Broadcast to live subscribers
         for ws in list(self.subscribers):
             try:
                 ws.send_str(json.dumps(rec))
-            except Exception:
+            except Exception as e:
+                log("WARN", f"ws broadcast failed, dropping subscriber: {e}")
                 self.subscribers.discard(ws)
+        log("INFO", f"ingest {source_ip or '?'} node={(rec or {}).get('node', '?')} type={(rec or {}).get('type', '?')} -> 200")
         return 200, {"ok": True}
 
     # -- HTTP handlers ------------------------------------------------------
@@ -367,12 +388,14 @@ class Gateway:
         try:
             envelope = await request.json()
         except Exception:
+            log("WARN", f"ingest {request.remote or '?'} bad_json -> 400")
             return web.json_response({"error": "bad_json"}, status=400)
         status, body = self.ingest(envelope, request.remote)
         return web.json_response(body, status=status)
 
     async def handle_status(self, request):
         events, sightings, csi = self.db.counts()
+        log("INFO", f"status {request.remote or '?'} events={events} sightings={sightings} csi={csi}")
         return web.json_response({
             "status": "ok",
             "protocol": "orb-v1",
@@ -386,7 +409,7 @@ class Gateway:
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         self.subscribers.add(ws)
-        print(f"[ws] client connected ({len(self.subscribers)} total)")
+        log("INFO", f"[ws] client connected ({request.remote or '?'}) ({len(self.subscribers)} total)")
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -402,7 +425,7 @@ class Gateway:
                     break
         finally:
             self.subscribers.discard(ws)
-            print(f"[ws] client disconnected ({len(self.subscribers)} total)")
+            log("INFO", f"[ws] client disconnected ({len(self.subscribers)} total)")
         return ws
 
 
@@ -424,8 +447,28 @@ def main():
     app.router.add_get("/status", gw.handle_status)
     app.router.add_get("/", gw.handle_status)
 
-    print(f"ORB gateway v1 on :{server['port']} (log={server['log_file']}, db={server['db_file']})")
-    print(f"world_model: {json.dumps(world_model)}")
+    async def _start_background(app):
+        # Liveness heartbeat: a log that never changes while the gateway
+        # works is indistinguishable from a dead gateway — write a line
+        # every HEARTBEAT_SECONDS so quiet periods stay diagnosable.
+        async def _heartbeat():
+            while True:
+                await asyncio.sleep(HEARTBEAT_SECONDS)
+                events, sightings, csi = gw.db.counts()
+                log("INFO", f"heartbeat: events={events} sightings={sightings} csi={csi} ws={len(gw.subscribers)}")
+
+        app["heartbeat_task"] = asyncio.create_task(_heartbeat())
+
+    async def _stop_background(app):
+        task = app.get("heartbeat_task")
+        if task:
+            task.cancel()
+
+    app.on_startup.append(_start_background)
+    app.on_cleanup.append(_stop_background)
+
+    log("INFO", f"ORB gateway v1 on :{server['port']} (log={server['log_file']}, db={server['db_file']})")
+    log("INFO", f"world_model: {json.dumps(world_model)}")
     web.run_app(app, host=server["host"], port=server["port"])
 
 
