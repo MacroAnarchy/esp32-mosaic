@@ -119,7 +119,7 @@ static void arpPostEvent(const char* type, const uint8_t* mac, const char* ip,
   arpMacToString(mac, macStr, sizeof(macStr));
   String bssid = WiFi.BSSIDstr();
   String url = String("http://") + MOSAIC_GATEWAY_HOST + ":" +
-               MOSAIC_GATEWAY_PORT + "/ingest";
+               MOSAIC_GATEWAY_PORT + "/orb/ingest";
   String payload = String("{\"v\":1,\"node\":\"") + MOSAIC_NODE_NAME +
                    "\",\"type\":\"" + type + "\",\"ts\":" + String(millis()) +
                    ",\"payload\":{\"ap_bssid\":\"" + bssid +

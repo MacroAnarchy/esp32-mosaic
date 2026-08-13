@@ -17,3 +17,30 @@ CONFIG_SPIRAM_CLK_IO=30
 CONFIG_SPIRAM_CS_IO=26
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+
+# --- Internal-RAM budget (orb-01 reporting fix 2026-08-13) ---
+# WiFi TX buffers MUST stay dynamic: static TX pins 16x1.6KB in internal DRAM
+# (with SPIRAM_USE_MALLOC the dynamic pool prefers PSRAM). orb-csi-test (the
+# working WiFi+CSI+display reference on this board) uses dynamic TX, and the
+# pre-M5GFX fix commit 009f23c intended the same. pio reconfigure drifts this
+# back to static — pin it here. NOTE: ESP_WIFI_DYNAMIC_TX_BUFFER depends on
+# !(SPIRAM_TRY_ALLOCATE_WIFI_LWIP && !SPIRAM_IGNORE_NOTFOUND), so dynamic TX
+# REQUIRES SPIRAM_IGNORE_NOTFOUND=y (no-op on this board — PSRAM always
+# present; it only unlocks the Kconfig dependency).
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_ESP32_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP32_WIFI_STATIC_TX_BUFFER=n
+
+# BLE controller adv-report flow-control pool (range 50-1000; ~35B/report):
+# observer-only sense engine (5s scan windows, 64-record cap) — 100 is
+# default-generous; 50 (min) keeps burst tolerance while shaving ~1.7KB.
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50
+
+# Task WDT: the face-render task (pinned CPU1, 33fps full-frame push from
+# PSRAM) legitimately maxes CPU1 under load (CSI ping + WiFi + BLE contend for
+# PSRAM bandwidth, frame exceeds the 30ms budget, IDLE1 starves). Widened to
+# 30s — same as the orb-csi-test reference (the working WiFi+CSI+display build
+# for this board). 5s tripped every frame cycle under load.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
