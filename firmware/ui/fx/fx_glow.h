@@ -79,6 +79,20 @@ public:
     /* Additive line (motion trails). */
     void addLine(float x0, float y0, float x1, float y1, uint8_t r, uint8_t g, uint8_t b);
 
+    /* Optional external backing store for the erase-seg list — hand it a
+     * PSRAM buffer to keep ~16KB out of the internal-RAM heap that the
+     * WiFi/BLE/lwIP stacks allocate from. Must be called before init().
+     * The caller owns the storage for the canvas's lifetime. */
+    void setSegStorage(void *storage, int capacity)
+    {
+        _segs = (Seg *)storage;
+        _segsCap = capacity;
+        _segsOwned = false;
+    }
+
+    static constexpr int kMaxDirty = 2048;
+    static constexpr int kMaxSegs  = 2048;  /* connected CSI bands need ~900 */
+
 private:
     static inline void add_px(uint16_t* p, uint8_t r, uint8_t g, uint8_t b)
     {
@@ -103,10 +117,10 @@ private:
     struct Seg {
         int16_t x0, y0, x1, y1;
     };
-    static constexpr int kMaxDirty = 2048;
-    static constexpr int kMaxSegs  = 512;
     Rect _dirty[kMaxDirty];
-    Seg _segs[kMaxSegs];
+    Seg *_segs = nullptr;
+    int _segsCap = 0;
+    bool _segsOwned = false;
     int _n_dirty = 0;
     int _n_segs  = 0;
 };

@@ -1,5 +1,6 @@
 /*
- * csi_sensing: WiFi CSI motion sensing (Tier 1) for the Mosaic sense engine.
+ * csi_sensing: WiFi CSI motion + presence sensing (Tier 1) for the Mosaic
+ * sense engine.
  *
  * Monostatic geometry: the node is an ordinary WiFi STA associated with its
  * home router, and its radio captures Channel State Information from the
@@ -10,15 +11,36 @@
  * connected AP's BSSID (the router). Router ping keeps the sampling path
  * fed with traffic.
  *
- * Scope (Tier 1): motion events only. An ACTIVE transition means radio-
- * visible movement on the channel; INACTIVE means the channel went quiet.
- * No vitals, no activity classification, no verified stationary presence —
- * those are later tiers and are NOT reported.
+ * Scope (Tier 1): motion events (moved/empty) + periodic feature snapshots
+ * (event:"feature", ~5s cadence) carrying presence + waveform metrics.
+ * An ACTIVE transition means radio-visible movement on the channel;
+ * INACTIVE means the channel went quiet. Presence ("presence_someone")
+ * comes from the component's calibrated wander channel — it only becomes
+ * meaningful after the auto-calibration (train) window completes at boot
+ * (the room should stay static for ~20s). No vitals, no activity
+ * classification.
+ *
+ * WANDER GATING (verified live 2026-08-13): esp-radar computes
+ * `waveform_wander` ONLY from template waveforms captured during a
+ * successful train. On a noisy channel (cat, neighbor APs, BLE, display)
+ * the background never settles below the component's 0.002 wander
+ * threshold, so train_stop fails ESP_ERR_INVALID_STATE, train_remove
+ * zeroes the templates and wander stays 0.0 — the observed state on the
+ * desk orb (wander=0.0000, train_valid=0 on every gateway row, while
+ * jitter runs 0.23..0.95). Motion (jitter, moved, smooth) needs no
+ * calibration and is always live. Consumers must NOT treat wander==0 as
+ * "no signal": the UI drives visualizations from a combined energy
+ * (max of wander/jitter norms — see display_face.cpp csi_energy) so the
+ * always-live jitter channel keeps the viz alive, and wander contributes
+ * automatically the night a quiet-room train succeeds.
  *
  * Events are queued (the FSM owns a background task; the callback must be
  * non-blocking) and drained by the sense task, which POSTs one
  * type:"csi" envelope per event to the gateway — reusing the existing
- * gateway envelope channel (no new sockets, no UDP).
+ * gateway envelope channel (no new sockets, no UDP). Feature snapshots
+ * are posted from the same sense loop (it cycles at ~20s, comfortably
+ * inside the channel-liveness window) so POSTs never collide with the
+ * BLE scan or the WiFi offline-scan cycle.
  *
  * Radio coexistence: CSI runs on the same STA association as the normal
  * WiFi client (the router-based Espressif examples do exactly this).
@@ -44,6 +66,15 @@ extern "C" {
 #ifndef MOSAIC_CSI_ENABLE
 #define MOSAIC_CSI_ENABLE 1
 #endif
+
+/* Live UI feature snapshot (struct declared in sense_engine.h — the
+ * face layer's data seam). The CSI module keeps a ~5Hz cache of the
+ * sensing FSM's channel diagnostics, refreshed by an esp_timer (a cheap
+ * read — no HTTP, no radio-path writes), and this getter copies it out
+ * for the render task. Returns false when CSI is disabled or no sample
+ * has been cached yet. */
+struct sense_csi_features;
+bool csi_sensing_get_ui_features(struct sense_csi_features *out);
 
 /* Create the sensing FSM with one channel (the AP BSSID) and start
  * processing. Requires the STA association (for the AP BSSID and the

@@ -22,6 +22,7 @@
 
 #include "display_face.h"
 #include "sense_engine.h"
+#include "touch_gestures.h"
 
 static const char *TAG = "mosaic-ui";
 
@@ -44,6 +45,14 @@ void app_main(void)
                  esp_err_to_name(ret));
     } else {
         ESP_LOGI(TAG, "sense engine started (BLE scan -> gateway)");
+    }
+
+    /* Touch (CST9217): double-tap / swipe cycles the CSI display mode.
+     * Failure is non-fatal — the face keeps rendering. */
+    ret = touch_gestures_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "touch_gestures_init failed: %s — auto-cycle only",
+                 esp_err_to_name(ret));
     }
 
     /* The dome is the default live view: calm idle when the ether is

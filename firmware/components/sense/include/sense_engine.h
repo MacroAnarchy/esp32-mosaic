@@ -53,6 +53,27 @@ typedef struct sense_device {
  * number of records copied. */
 int sense_engine_get_devices(sense_device_t *out, int max_records);
 
+/* Live CSI feature snapshot for the face layer (radio dome CSI
+ * visualization). The sense engine's CSI module samples the sensing
+ * FSM's channel diagnostics at ~5Hz into a tiny cache (a cheap read —
+ * no HTTP, never touches the radio path) and this getter copies it out
+ * for the render task. Returns false when CSI is disabled or no sample
+ * has been cached yet — the UI then renders its calm/absent state.
+ * Thread-safe (spinlock-guarded copy). */
+typedef struct sense_csi_features {
+    float wander;        /* waveform dynamics (presence-related), 0..~1+ */
+    float jitter;        /* waveform jitter (motion-related), 0..1 */
+    float smooth;        /* smoothed feature score (internal scaled units) */
+    bool someone;        /* calibrated presence: someone stationary */
+    bool moved;          /* channel in ACTIVE/DEBOUNCE_ACTIVE (motion now) */
+    bool presenceReady;  /* per-channel presence window has enough samples */
+    bool trainValid;     /* presence calibration thresholds cached */
+    uint32_t updatedMs;  /* sense uptime ms of the last cached sample */
+    uint32_t sampleId;   /* monotonic sample counter (detect fresh data) */
+} sense_csi_features_t;
+
+bool sense_engine_get_csi_features(sense_csi_features_t *out);
+
 /* True when the node currently has an IP lease (gateway reachable). */
 bool sense_wifi_is_connected(void);
 

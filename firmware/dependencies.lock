@@ -61,6 +61,16 @@ dependencies:
     - esp32c6
     - esp32c61
     version: 0.1.5
+  espressif/esp_lcd_touch:
+    component_hash: 3f85a7d95af876f1a6ecca8eb90a81614890d0f03a038390804e5a77e2caf862
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.1
   espressif/esp_radar_motion_dec:
     component_hash: c4e2ff510fb3ffff2cc6347b059e4c264515aebb1cf427ca3bc9398b4941b857
     dependencies:
@@ -115,8 +125,9 @@ dependencies:
     version: 5.5.3
 direct_dependencies:
 - espressif/cmake_utilities
+- espressif/esp_lcd_touch
 - espressif/esp_wifi_sensing
 - idf
-manifest_hash: 93c685cefda69c17455ae9824a9825df2108fd4bbbae832f9136c7ed9eb004de
+manifest_hash: f88e9a5e686863c5f5771a834e11862513a583ed611abc986449eaf0a86f8ca8
 target: esp32s3
 version: 2.0.0

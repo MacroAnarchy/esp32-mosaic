@@ -30,6 +30,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 #include <M5GFX.h>
 #include <lgfx/v1/panel/Panel_AMOLED.hpp>
@@ -41,6 +43,77 @@
 static const char *TAG = "display_face";
 
 using namespace fx;
+
+/* ------------------------------------------------------------------ */
+/* Trig LUT — the S3 has no FPU; a table lookup instead of a software  */
+/* sinf per sample keeps the connected-band rendering (hundreds of     */
+/* segments per frame) well inside the 33fps budget. Allocated in      */
+/* PSRAM (8KB) to keep internal RAM for the WiFi/BLE/lwIP heaps.       */
+/* ------------------------------------------------------------------ */
+
+static float *s_cosLut = nullptr;
+static float *s_sinLut = nullptr;
+
+static inline float lut_cos(float a)
+{
+    return s_cosLut[((int)(a * 162.9746f)) & 1023];  /* 1024 / 2pi */
+}
+
+static inline float lut_sin(float a)
+{
+    return s_sinLut[((int)(a * 162.9746f)) & 1023];
+}
+
+static void trig_lut_build(void)
+{
+    s_cosLut = (float *)heap_caps_malloc(1024 * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_sinLut = (float *)heap_caps_malloc(1024 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (s_cosLut == nullptr) s_cosLut = (float *)malloc(1024 * sizeof(float));
+    if (s_sinLut == nullptr) s_sinLut = (float *)malloc(1024 * sizeof(float));
+    if (s_cosLut == nullptr || s_sinLut == nullptr) {
+        ESP_LOGE(TAG, "trig LUT alloc failed — CSI bands will render at half rate");
+        return;
+    }
+    for (int i = 0; i < 1024; i++) {
+        float a = (float)i * 0.00613592315f;  /* 2pi / 1024 */
+        s_cosLut[i] = cosf(a);
+        s_sinLut[i] = sinf(a);
+    }
+}
+
+/* PSRAM scratch for the connected-band renderers (~5.4KB out of the
+ * internal-RAM heap; the canvas framebuffer already lives in PSRAM). */
+static float *s_ringScratch[3];  /* 128 samples: x, y, intensity */
+static float *s_waveScratch[3];  /* CSI_WAVE_N samples            */
+static float *s_haloScratch[3];  /* 150 samples                   */
+static float *s_ripScratch[3];   /* 72 samples                    */
+
+static void csi_scratch_alloc(void)
+{
+    float *p = (float *)heap_caps_malloc(128 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (p == nullptr) p = (float *)malloc(128 * 3 * sizeof(float));
+    s_ringScratch[0] = p; s_ringScratch[1] = p + 128; s_ringScratch[2] = p + 256;
+
+    p = (float *)heap_caps_malloc(96 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);   /* CSI_WAVE_N */
+    if (p == nullptr) p = (float *)malloc(96 * 3 * sizeof(float));
+    s_waveScratch[0] = p; s_waveScratch[1] = p + 96; s_waveScratch[2] = p + 192;
+
+    p = (float *)heap_caps_malloc(150 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (p == nullptr) p = (float *)malloc(150 * 3 * sizeof(float));
+    s_haloScratch[0] = p; s_haloScratch[1] = p + 150; s_haloScratch[2] = p + 300;
+
+    p = (float *)heap_caps_malloc(72 * 3 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (p == nullptr) p = (float *)malloc(72 * 3 * sizeof(float));
+    s_ripScratch[0] = p; s_ripScratch[1] = p + 72; s_ripScratch[2] = p + 144;
+}
+
+/* 8-bit color channel scaled by an intensity 0..1, clamped (addLine
+ * takes raw channels, so intensity must be baked in by the caller). */
+static inline uint8_t scale8(uint8_t c, float s)
+{
+    float v = (float)c * s;
+    return v >= 255.0f ? 255 : (uint8_t)v;
+}
 
 /* ------------------------------------------------------------------ */
 /* Face configuration per state                                        */
@@ -160,6 +233,69 @@ static sense_device_t s_snap[DOME_MAX_DEVICES];  /* sense table snapshot */
 static uint32_t s_frame = 0;                     /* render frame counter */
 static float s_time = 0.0f;                      /* frames as float */
 static float s_sweepAngle = 0.0f;                /* radar sweep (rad) */
+
+/* ------------------------------------------------------------------ */
+/* CSI visualization state — driven by REAL sense-engine features      */
+/* (sense_engine_get_csi_features: wander / jitter / presence / move). */
+/* ------------------------------------------------------------------ */
+
+/* Mode: -1 = auto-cycle (default), else pinned CSI_MODE_* value. */
+static volatile int s_csiModeReq = -1;
+static csi_mode_t s_csiMode = CSI_MODE_MERGED;
+
+#define CSI_AUTO_CYCLE_FRAMES (60 * 33)  /* ~60s per mode at 33fps (touch takes over once used) */
+
+/* Motion-pulse state: rising edge of `moved` fires an expanding ripple. */
+static float s_csiPulse = 0.0f;   /* 1.0 fresh spike -> 0.0 decayed */
+static bool  s_csiMovedPrev = false;
+
+/* Polar waveform history — the combined living energy signal, plotted
+ * faithfully. Appended at the ~5Hz cache cadence (sampleId changes);
+ * 96 samples = ~19s of live signal. Wander alone is calibration-gated
+ * (0.0 on noisy channels), so the buffer holds csi_energy() — the same
+ * drive the rings use — guaranteeing a living trace at all times. */
+#define CSI_WAVE_N 96
+static float s_wave[CSI_WAVE_N];
+static int   s_waveHead = 0;
+static uint32_t s_waveLastId = 0xFFFFFFFFu;
+
+/* Feature normalization — observed value ranges (mosaic-research
+ * capability map: wander spikes on motion, jitter 0.29..0.99 on the
+ * live gateway rows) mapped to a 0..1 visual drive. Linear, clamped. */
+static inline float csi_norm_wander(float w) { float v = w * 2.5f; return v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v); }
+static inline float csi_norm_jitter(float j) { float v = j * 1.3f;  return v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v); }
+
+/* Combined living energy — the master visual drive.
+ *
+ * wander is calibration-gated: esp-radar only computes waveform_wander
+ * from templates captured during a successful train, which fails on
+ * noisy channels (verified live: wander=0.0000 train_valid=0 on every
+ * gateway row while jitter runs 0.23..0.95 — see csi_sensing.h). The
+ * viz must therefore drive from BOTH features: whichever is alive wins.
+ * A calm room shows the jitter floor (clear visible structure at rest);
+ * motion pushes the drive bright. */
+static inline float csi_energy(float wander, float jitter)
+{
+    float w = csi_norm_wander(wander);
+    float j = csi_norm_jitter(jitter);
+    return w > j ? w : j;
+}
+
+/* Staleness factor: 1.0 while fresh, decaying to 0.0 once the cache
+ * stops updating (~5s) — the CSI viz calms honestly when the radio
+ * goes quiet/offline instead of holding a frozen pattern. */
+static inline float csi_freshness(const sense_csi_features_t &c)
+{
+    uint32_t ageMs = (uint32_t)(esp_timer_get_time() / 1000) - c.updatedMs;
+    if (ageMs > 5000u) return 0.0f;
+    return 1.0f - (float)ageMs / 5000.0f;
+}
+
+static void csi_wave_push(float v)
+{
+    s_wave[s_waveHead] = v;
+    s_waveHead = (s_waveHead + 1) % CSI_WAVE_N;
+}
 
 /* ------------------------------------------------------------------ */
 /* Vignette for the round cutout — soft edge falloff at the rim.       */
@@ -472,6 +608,9 @@ esp_err_t display_face_init(void)
         }
     }
 
+    trig_lut_build();
+    csi_scratch_alloc();
+
     /* Board bring-up: bring the CO5300 panel up through M5GFX with a
      * PSRAM framebuffer (the StopWatch-Flux pattern). */
     s_display = new MosaicDisplay();
@@ -486,6 +625,16 @@ esp_err_t display_face_init(void)
      * it renders glow stamps straight into the panel framebuffer and the
      * flush pushes the frame with one display() call per frame. */
     static uint16_t *s_rows[kScreenH];  /* static: too big for app_main stack */
+
+    /* PSRAM-backed erase-seg list for the canvas: keeps ~16KB of
+     * internal RAM free for the WiFi/BLE/lwIP join-time allocations. */
+    void *segStore = heap_caps_malloc(GlowCanvas::kMaxSegs * 8, MALLOC_CAP_SPIRAM);
+    if (segStore != nullptr) {
+        s_canvas.setSegStorage(segStore, GlowCanvas::kMaxSegs);
+    } else {
+        ESP_LOGW(TAG, "seg storage PSRAM alloc failed — canvas uses internal heap");
+    }
+
     bool have_rows = false;
     auto fb = fb_panel();
     if (fb != nullptr) {
@@ -547,6 +696,28 @@ esp_err_t display_face_set_suspended(bool suspended)
     s_suspended = suspended;
     if (s_mutex) xSemaphoreGive(s_mutex);
     return ESP_OK;
+}
+
+esp_err_t display_face_set_csi_mode(int mode)
+{
+    if (mode < -1 || mode >= (int)CSI_MODE_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_csiModeReq = mode;
+    if (mode >= 0) {
+        s_csiMode = (csi_mode_t)mode;  /* pinned — switch immediately */
+    }
+    if (s_mutex) xSemaphoreGive(s_mutex);
+    ESP_LOGI(TAG, "csi mode -> %s",
+             mode < 0 ? "auto" : (mode == CSI_MODE_MERGED ? "merged" :
+             mode == CSI_MODE_STANDALONE ? "standalone" : "off"));
+    return ESP_OK;
+}
+
+csi_mode_t display_face_get_csi_mode(void)
+{
+    return s_csiMode;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1031,6 +1202,303 @@ static void render_voice_ring(float energy, float gain)
 }
 
 /* ------------------------------------------------------------------ */
+/* CSI visualization — the radio dome's second sense, rendered live.   */
+/*                                                                     */
+/* Both modes are driven by the sense engine's REAL channel features:  */
+/*   energy (max of wander/jitter norms) -> shape/amplitude — the      */
+/*              master drive (see csi_energy: wander alone is          */
+/*              calibration-gated to 0 on noisy channels)              */
+/*   jitter  -> angular motion + sparkle (motion energy)               */
+/*   someone -> warm presence tint + slow breathing-band envelope      */
+/*              (0.2-0.5Hz annotated on top, per the capability map)   */
+/*   moved   -> expanding ripple pulses from the core                  */
+/* Raw signal rendered faithfully, known patterns annotated — no       */
+/* labels, no fake animation: when the ether is calm the pattern is    */
+/* calm, when someone walks past it visibly reacts.                    */
+/* ------------------------------------------------------------------ */
+
+/* Motion ripple: one frame of edge-trigger state per render frame. */
+static void csi_motion_tick(const sense_csi_features_t &c, bool have, float freshness)
+{
+    bool moved = have && c.moved && freshness > 0.0f;
+    if (moved && !s_csiMovedPrev) {
+        s_csiPulse = 1.0f;
+    }
+    s_csiMovedPrev = moved;
+    s_csiPulse *= 0.94f;   /* ~1.3s visible tail */
+}
+
+/* ------------------------------------------------------------------ */
+/* Connected glowing band helper                                       */
+/*                                                                     */
+/* The spectrograph look: a closed polyline of samples drawn as a      */
+/* bright core LINE between consecutive points plus a soft glow DOT    */
+/* at every `dotStride`-th vertex. Lines read as continuous flowing    */
+/* bands, the glow dots give them thickness and bloom — the            */
+/* "M5Stack-Flux" treatment instead of scattered radius-1 specks.      */
+/* dotStride=2 halves the dot cost on the big rings (the lines carry   */
+/* the band) and keeps the standalone mode inside the 33fps budget.    */
+/* ------------------------------------------------------------------ */
+
+static void draw_glow_band(const float *xs, const float *ys, const float *is,
+                           int n, const Rgb &col, float glowScale, int dotStride = 1)
+{
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;   /* closed ring */
+        float inten = (is[i] + is[j]) * 0.5f;
+        s_canvas.addLine(xs[i], ys[i], xs[j], ys[j],
+                         scale8(col.r, inten), scale8(col.g, inten),
+                         scale8(col.b, inten));
+        if ((i % dotStride) == 0) {
+            s_canvas.addGlowDot(xs[i], ys[i], col, is[i] * glowScale, 2);
+        }
+    }
+}
+
+/* Expanding double ring fired on a motion edge — now connected arcs
+ * with a glow, not single-pixel dots. Shared by both modes. */
+static void render_csi_ripple(float gain)
+{
+    if (s_csiPulse <= 0.03f) return;
+    float p = s_csiPulse;
+    float *px = s_ripScratch[0], *py = s_ripScratch[1], *pi = s_ripScratch[2];
+
+    float r1 = 26.0f + (1.0f - p) * 130.0f;
+    for (int i = 0; i < 72; i++) {
+        float a = (float)i / 72.0f * 6.2831853f;
+        px[i] = kCenterX + lut_cos(a) * r1;
+        py[i] = kCenterY + lut_sin(a) * r1;
+        pi[i] = p * 0.42f * gain;
+    }
+    draw_glow_band(px, py, pi, 72, { 255, 235, 210 }, 0.7f, 1);
+
+    float r2 = r1 + 15.0f;
+    for (int i = 0; i < 56; i++) {
+        float a = (float)i / 56.0f * 6.2831853f + p * 0.5f;
+        px[i] = kCenterX + lut_cos(a) * r2;
+        py[i] = kCenterY + lut_sin(a) * r2;
+        pi[i] = p * 0.22f * gain;
+    }
+    draw_glow_band(px, py, pi, 56, { 255, 200, 160 }, 0.6f, 1);
+}
+
+/* CSI MERGED: a living membrane around the core — Siri-like morphing
+ * ring inside the dome's inner ring. combined energy morphs its shape,
+ * jitter spins + sparkles it, presence opens it warm with a 0.2-0.5Hz
+ * breath. Drawn as a CONNECTED GLOWING BAND (core line + vertex glow)
+ * so it reads as a flowing membrane, not scattered dots. Clearly
+ * visible in IDLE (jitter floor), alive when the channel reacts. */
+static void render_csi_halo(float gain)
+{
+    sense_csi_features_t c;
+    bool have = sense_engine_get_csi_features(&c);
+    float fresh = have ? csi_freshness(c) : 0.0f;
+    float wm = have ? csi_norm_wander(c.wander) : 0.0f;
+    float jm = have ? csi_norm_jitter(c.jitter) : 0.0f;
+    float en = have ? csi_energy(c.wander, c.jitter) : 0.0f;
+    float someone = have && c.someone ? 1.0f : 0.0f;
+    if (fresh <= 0.0f) { wm = 0.0f; jm = 0.0f; en = 0.0f; someone = 0.0f; }  /* radio quiet/offline: calm */
+    csi_motion_tick(c, have, fresh);
+
+    const int N = 150;
+    float *hx = s_haloScratch[0], *hy = s_haloScratch[1], *hi = s_haloScratch[2];
+    /* breathing-band annotation (~0.29Hz at 33fps) — the known pattern,
+     * scaled by reality: only audible when presence/motion is real. */
+    float breath = 0.5f + 0.5f * lut_sin(s_time * 0.0088f + 1.7f);
+    float baseR = 76.0f + 10.0f * someone * breath;         /* presence opens the halo — big base ring, clearly visible */
+    float morph = 9.0f + 24.0f * en;                        /* combined energy morphs the shape (wander OR jitter) */
+    float rot = s_time * (0.0035f + 0.018f * jm);           /* jitter spins it faster */
+    Rgb col = lerpRgb({ 120, 190, 255 }, { 255, 175, 90 }, someone * 0.8f);
+
+    for (int i = 0; i < N; i++) {
+        float a = (float)i / N * 6.2831853f + rot;
+        float w1 = 0.5f + 0.5f * lut_sin(a * 3.0f + s_time * 0.016f);
+        float w2 = 0.5f + 0.5f * lut_sin(a * 5.0f - s_time * 0.011f + (float)i * 0.63f);
+        float r = baseR + (w1 * w2 - 0.25f) * 2.0f * morph +
+                  2.0f * lut_sin(s_time * 0.02f + (float)i);
+        if (r < 30.0f) r = 30.0f;
+        if (r > 108.0f) r = 108.0f;   /* stay clear of the dome's inner ring (94) */
+        a += jm * 0.06f * lut_sin(s_time * 0.08f + (float)i * 2.17f);
+        float flick = 0.72f + 0.28f * lut_sin(s_time * 0.10f + (float)i * 1.31f);
+        /* Energy-driven: the halo stays clearly visible at the jitter
+         * floor (calm room) and flares with motion — never hidden by
+         * the wander calibration gate. */
+        hi[i] = (0.17f + 0.15f * someone + 0.18f * en * flick + 0.06f * wm) * gain;
+        if (hi[i] <= 0.01f) { hi[i] = 0.0f; }
+        hx[i] = kCenterX + lut_cos(a) * r;
+        hy[i] = kCenterY + lut_sin(a) * r;
+    }
+    draw_glow_band(hx, hy, hi, N, col, 0.55f, 3);
+
+    /* presence aura behind the core */
+    if (someone > 0.0f) {
+        s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 190, 110 },
+                            (0.10f + 0.06f * breath) * gain, 18);
+    }
+
+    render_csi_ripple(gain);
+}
+
+/* CSI STANDALONE: full-screen signal anatomy, denser than the dome.
+ *   - frequency rings: CONNECTED GLOWING BANDS (core line + vertex
+ *     glow) with coherent geometry — each ring is a radiation-pattern
+ *     lobe field (3..8 interference petals that breathe like standing
+ *     waves), spirally twisted from inner to outer rings, slowly
+ *     rotating (jitter spins it). Energy bands (multi-scale EMA on the
+ *     combined wander/jitter drive — wander alone is calibration-gated
+ *     to 0, so the rings would vanish) set the petal amplitude, so the
+ *     channel's living dynamics spread from fast (inner) to slow
+ *     (outer) rings
+ *   - polar waveform: the combined living energy plotted faithfully
+ *     over ~19s of history as a flowing glow ribbon with a bright
+ *     leading comet
+ *   - presence: warm breathing aura + breath-brightened pattern
+ *   - motion: expanding ripple arcs + radial sparks from the core
+ *   - absence: a quiet room rests the rings and the waveform at their
+ *     visible base intensities — the calm IS the absence annotation
+ *     (no labels needed) */
+static void render_csi_standalone(float gain)
+{
+    sense_csi_features_t c;
+    bool have = sense_engine_get_csi_features(&c);
+    float fresh = have ? csi_freshness(c) : 0.0f;
+    float jm = have ? csi_norm_jitter(c.jitter) : 0.0f;
+    float en = have ? csi_energy(c.wander, c.jitter) : 0.0f;
+    float someone = have && c.someone ? 1.0f : 0.0f;
+    if (fresh <= 0.0f) { jm = 0.0f; en = 0.0f; someone = 0.0f; }
+    csi_motion_tick(c, have, fresh);
+
+    /* keep the dome device table + particle pool alive while standalone
+     * owns the screen (devices must not age-out or pile up invisibly) */
+    dome_refresh();
+    for (int i = 0; i < DOME_POOL_SIZE; i++) {
+        DomeParticle &p = s_pool[i];
+        if (!p.alive) continue;
+        p.age += 1.0f;
+        p.u += p.speed;
+        if (p.u >= 1.0f || p.age > p.life) p.alive = 0;
+    }
+
+    /* append fresh waveform samples (one per 5Hz cache tick) — store the
+     * combined energy (0..1) so the trace is alive even when wander is
+     * calibration-gated at 0 */
+    if (have && c.sampleId != s_waveLastId) {
+        s_waveLastId = c.sampleId;
+        csi_wave_push(csi_energy(c.wander, c.jitter));
+    }
+
+    float breath = 0.5f + 0.5f * lut_sin(s_time * 0.0088f + 2.3f);   /* 0.2-0.5Hz annotation */
+
+    /* --- frequency rings: connected glowing bands ---
+     * Geometry is COHERENT, not scattered: every ring carries a lobe
+     * field (standing-wave interference petals) whose amplitude follows
+     * its energy band; rings are angularly twisted into a gentle spiral;
+     * the whole pattern rotates with jitter. Calm room = calm petals,
+     * motion = the petals swell and the bands brighten. */
+    static const float kRingR[6] = { 46.0f, 72.0f, 98.0f, 170.0f, 196.0f, 218.0f };
+    static const int   kRingN[6] = { 36, 48, 64, 84, 96, 104 };
+    static const float kRingRate[6] = { 0.30f, 0.19f, 0.12f, 0.07f, 0.042f, 0.024f };
+    static const float kLobes[6]  = { 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };    /* interference lobes per ring */
+    static const float kTwist[6]  = { 0.0f, 0.09f, 0.22f, 0.40f, 0.62f, 0.88f }; /* spiral arm twist (rad) */
+    static float s_wband[6] = { 0, 0, 0, 0, 0, 0 };
+    for (int k = 0; k < 6; k++) {
+        s_wband[k] += (en - s_wband[k]) * kRingRate[k];
+    }
+    float *sx = s_ringScratch[0], *sy = s_ringScratch[1], *si = s_ringScratch[2];   /* largest ring: 116 samples */
+    float rot = s_time * (0.0012f + 0.014f * jm);      /* jitter spins the pattern */
+    float lobephase = s_time * 0.006f;                 /* slow standing-wave drift */
+    for (int k = 0; k < 6; k++) {
+        float band = s_wband[k];
+        float baseI = (0.15f + 0.36f * band) * gain;
+        if (baseI <= 0.004f) continue;
+        Rgb col = lerpRgb({ 80, 160, 255 }, { 255, 170, 90 }, someone * 0.75f);
+        /* standing-wave amplitude: subtle at rest, swelling petals on
+         * motion; outer rings may swing wider than inner ones */
+        float swAmp = (2.5f + 15.0f * band) * (0.5f + 0.10f * (float)k);
+        int N = kRingN[k];
+        for (int i = 0; i < N; i++) {
+            float a = rot + kTwist[k] + (float)i / N * 6.2831853f;
+            /* two superimposed lobe modes — a petal field that breathes */
+            float lobes = kLobes[k];
+            float dr = swAmp * (0.62f * lut_sin(lobes * a + lobephase + (float)k * 1.7f)
+                              + 0.38f * lut_sin((lobes + 2.0f) * a - lobephase * 0.7f - (float)k));
+            /* jitter aberration shivers the band when the channel moves */
+            float aa = a + jm * 0.18f * lut_sin(a * 2.0f + s_time * 0.028f);
+            float rr = kRingR[k] + dr;
+            if (rr < 18.0f) rr = 18.0f;
+            if (rr > 224.0f) rr = 224.0f;   /* keep inside the lens disc */
+            /* gentle light-and-shadow envelope along the band (coherent,
+             * not per-dot grain) */
+            float env = 0.80f + 0.20f * lut_sin(a * 3.0f + s_time * 0.010f + (float)k * 1.9f);
+            float breathBoost = someone ? (1.0f + 0.30f * breath) : 1.0f;
+            si[i] = baseI * env * breathBoost;
+            sx[i] = kCenterX + lut_cos(aa) * rr;
+            sy[i] = kCenterY + lut_sin(aa) * rr;
+        }
+        draw_glow_band(sx, sy, si, N, col, 0.6f, 4);
+    }
+
+    /* --- polar waveform: the combined living energy, faithfully ---
+     * Buffer holds csi_energy (0..1), scaled to the ACTUAL observed
+     * range: jitter floor ~0.29 (norm ~0.38) already reads as a living
+     * ring; motion pushes it out bright. Drawn as a connected glow
+     * ribbon with a leading comet, not a circle of dots. */
+    {
+        Rgb wcol = lerpRgb({ 120, 200, 255 }, { 255, 170, 110 }, jm * 0.9f);
+        float *wx = s_waveScratch[0], *wy = s_waveScratch[1], *wi = s_waveScratch[2];
+        float wrot = 0.02f * lut_sin(s_time * 0.005f);
+        for (int i = 0; i < CSI_WAVE_N; i++) {
+            float v = s_wave[(s_waveHead + i) % CSI_WAVE_N];
+            float nv = v > 1.0f ? 1.0f : (v < 0.0f ? 0.0f : v);
+            float a = (float)i / CSI_WAVE_N * 6.2831853f + wrot;
+            float r = 133.0f + (nv - 0.5f) * 50.0f;   /* lane between rings 98 and 170 */
+            wx[i] = kCenterX + lut_cos(a) * r;
+            wy[i] = kCenterY + lut_sin(a) * r;
+            wi[i] = (0.30f + 0.45f * nv) * gain;
+        }
+        draw_glow_band(wx, wy, wi, CSI_WAVE_N, wcol, 0.55f, 2);
+        /* bright leading comet at the newest sample */
+        s_canvas.addGlowDot(wx[CSI_WAVE_N - 1], wy[CSI_WAVE_N - 1],
+                            { 255, 255, 255 }, 0.55f * gain, 3);
+    }
+
+    /* --- presence aura + breathing --- */
+    if (someone > 0.0f) {
+        s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 180, 100 },
+                            (0.16f + 0.08f * breath) * gain, 26);
+        s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 150, 70 },
+                            (0.10f + 0.06f * breath) * gain, 14);
+    }
+
+    /* --- motion: ripple + radial sparks --- */
+    if (s_csiPulse > 0.03f) {
+        for (int k = 0; k < 28; k++) {
+            float a = (float)k / 28.0f * 6.2831853f + s_time * 0.01f;
+            float r = 30.0f + (1.0f - s_csiPulse) * 185.0f + (float)(k % 3) * 6.0f;
+            s_canvas.addGlowDot(kCenterX + lut_cos(a) * r, kCenterY + lut_sin(a) * r,
+                                { 255, 240, 220 }, s_csiPulse * 0.40f * gain, 2);
+        }
+    }
+    render_csi_ripple(gain);
+
+    /* --- rotating tick on the rim — the instrument's hand, with a
+     * short trailing arc so it reads as a sweep, not a speck --- */
+    {
+        float tickA = s_time * (0.004f + 0.03f * jm);
+        float r = 218.0f;
+        s_canvas.addGlowDot(kCenterX + lut_cos(tickA) * r, kCenterY + lut_sin(tickA) * r,
+                            { 240, 250, 255 }, 0.55f * gain, 4);
+        for (int i = 1; i <= 6; i++) {
+            float a = tickA - (float)i * 0.06f;
+            s_canvas.addGlowDot(kCenterX + lut_cos(a) * r, kCenterY + lut_sin(a) * r,
+                                { 160, 200, 240 }, 0.16f * gain * (1.0f - (float)i / 7.0f), 2);
+        }
+    }
+
+    render_center(gain);
+}
+
+/* ------------------------------------------------------------------ */
 /* Render loop                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1059,6 +1527,12 @@ static void render_dome(face_state_t state)
     } else if (state == FACE_OWNER_NEAR) {
         render_wisps(gain);
     }
+
+    /* CSI MERGED: the dome stays the base, the halo morphs around the
+     * core in the same frame, driven by the live channel features. */
+    if (s_csiMode == CSI_MODE_MERGED) {
+        render_csi_halo(gain);
+    }
 }
 
 static void face_task(void *arg)
@@ -1066,6 +1540,7 @@ static void face_task(void *arg)
     (void)arg;
     TickType_t last = xTaskGetTickCount();
     const TickType_t frame_ms = pdMS_TO_TICKS(1000 / 33); /* 33fps */
+    int64_t tFrame0 = esp_timer_get_time();
 
     for (;;) {
         if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1073,15 +1548,66 @@ static void face_task(void *arg)
         bool suspended = s_suspended;
         if (s_mutex) xSemaphoreGive(s_mutex);
 
+        /* CSI mode: pinned, or auto-cycling every ~30s (merged ->
+         * standalone -> plain dome -> ...). */
+        int modeReq;
+        if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+        modeReq = s_csiModeReq;
+        if (s_mutex) xSemaphoreGive(s_mutex);
+        csi_mode_t prevMode = s_csiMode;
+        if (modeReq < 0) {
+            if (s_frame > 0 && (s_frame % CSI_AUTO_CYCLE_FRAMES) == 0) {
+                s_csiMode = (csi_mode_t)(((int)s_csiMode + 1) % CSI_MODE_COUNT);
+                ESP_LOGI(TAG, "CSI mode auto -> %d (%s)", (int)s_csiMode,
+                         s_csiMode == CSI_MODE_MERGED ? "merged" :
+                         s_csiMode == CSI_MODE_STANDALONE ? "standalone" : "off");
+            }
+        } else {
+            s_csiMode = (csi_mode_t)modeReq;
+        }
+        if (s_csiMode != prevMode) {
+            /* mode switch: drop stale motion/ripple transients */
+            s_csiPulse = 0.0f;
+            s_csiMovedPrev = false;
+        }
+
         s_canvas.beginFrame();
 
         if (!suspended) {
             s_frame++;
             s_time += 1.0f;
-            render_dome(state);
+            if (s_csiMode == CSI_MODE_STANDALONE) {
+                float gain = (state == FACE_SLEEP) ? 0.10f : 1.0f;
+                render_csi_standalone(gain);
+            } else {
+                render_dome(state);
+            }
         }
 
         s_canvas.push();
+
+        /* Periodic verification log: live features + mode + frame time
+         * (every ~4.5s). Proves the viz is driven by REAL data. */
+        if ((s_frame % 150) == 0) {
+            int64_t tNow = esp_timer_get_time();
+            float frameMs = (float)(tNow - tFrame0) / 1000.0f;
+            tFrame0 = tNow;
+            sense_csi_features_t c;
+            bool have = sense_engine_get_csi_features(&c);
+            ESP_LOGI(TAG,
+                     "frame=%lu mode=%d devs=%d csi=%s id=%u age=%ums "
+                     "wander=%.4f jitter=%.4f smooth=%.0f someone=%d moved=%d "
+                     "ready=%d train=%d render=%.1fms",
+                     (unsigned long)s_frame, (int)s_csiMode,
+                     sense_engine_get_device_count(), have ? "yes" : "no",
+                     (unsigned)c.sampleId,
+                     have ? (unsigned)((uint32_t)(tNow / 1000) - c.updatedMs) : 0u,
+                     have ? (double)c.wander : 0.0, have ? (double)c.jitter : 0.0,
+                     have ? (double)c.smooth : 0.0,
+                     have ? (int)c.someone : 0, have ? (int)c.moved : 0,
+                     have ? (int)c.presenceReady : 0, have ? (int)c.trainValid : 0,
+                     (double)frameMs);
+        }
 
         vTaskDelayUntil(&last, frame_ms);
     }
