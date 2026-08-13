@@ -1224,7 +1224,7 @@ def owner_view(c, hours=24, report=True):
                                  f"WiFi-join confirmation")
             else:
                 row["state"] = "STALE"
-                row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac'][:8]}…, "
+                row["detail"] = (f"slot ended {age/3600:.1f}h ago (last {row['active_mac']}, "
                                  f"level {row['anchor_avg']})")
             out.append(row)
             continue
