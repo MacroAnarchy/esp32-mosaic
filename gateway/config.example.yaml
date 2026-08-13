@@ -144,7 +144,10 @@ world_model:
   channel_csi_max_age_seconds: 43200    # body/motion events (12h quiet OK)
 
   # Node registry hygiene: one-off test registrations (sub-minute lives,
-  # loopback IPs) would show 'GONE' in --status forever. List them here so
-  # the node roster shows only real sensors. Empty by default — the repo
-  # stays neutral; each deployment opts in.
+  # loopback IPs) would show 'GONE' in --status forever. The brain
+  # AUTO-DETECTS phantoms by signature: loopback IP (127.x.x.x) or a
+  # lifetime below phantom_min_lifetime_seconds with no model/firmware
+  # reported. This catches every test registration without chasing names.
+  # node_ignore_list is a supplementary manual escape hatch (edge cases).
+  phantom_min_lifetime_seconds: 120  # nodes alive < this (no identity) = phantom
   node_ignore_list: []

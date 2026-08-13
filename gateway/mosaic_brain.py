@@ -73,6 +73,38 @@ def _parse_ts(iso):
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
+
+def _is_phantom_node(first_seen, last_seen, last_ip, model, firmware):
+    """Detect a one-off test-registration phantom by its signature.
+
+    Phantoms are 30-second test nodes that register from loopback, vanish
+    forever, and pollute the --status node roster. The user-agent has filed
+    this repeatedly (clawd, probe, route-probe, ws-test, test-node,
+    gym-kali-01-test) — each is a new name, so chasing names in a config
+    list is a losing game. Instead, detect by STRUCTURAL signature:
+
+      - LOOPBACK IP (127.x.x.x): real nodes never register from loopback.
+      - SHORT LIFE + NO IDENTITY: lifetime < phantom_min_lifetime_seconds
+        AND no model/firmware reported (real ESP32 nodes report both).
+
+    Either condition flags a phantom. A real node that briefly connected
+    (power-loss reboot, etc.) but has a model/firmware survives — it has
+    an identity, so it's a real node that may come back.
+
+    Returns True if this row is a phantom, False otherwise.
+    """
+    # Loopback = always phantom (real nodes register from a real LAN IP).
+    if last_ip and last_ip.startswith("127."):
+        return True
+    # Short life + no identity = phantom (30s test registrations).
+    fs, ls = _parse_ts(first_seen), _parse_ts(last_seen)
+    if fs and ls:
+        life = (ls - fs).total_seconds()
+        if life < WM.get("phantom_min_lifetime_seconds", 120) \
+                and not model and not firmware:
+            return True
+    return False
+
 # Tuning (static for now — tuned the hard way, see gateway config)
 # NOTE: spread is now ROBUST p10-p90 (not raw max-min). A single deep-fade
 # sample (-106 in a -58..-66 cluster) previously flipped a stationary AirTag
@@ -176,9 +208,14 @@ DEFAULT_WM = {
     "channel_probes_max_age_seconds": 3600,
     "channel_csi_max_age_seconds": 43200,
     # Node registry hygiene: one-off test registrations (sub-minute lives,
-    # loopback IPs) would show 'GONE' in --status forever. Deployments list
-    # them here so the node roster shows only real sensors. Empty by default —
-    # the repo stays neutral; each deployment opts in via config.yaml.
+    # loopback IPs) would show 'GONE' in --status forever. Two layers of
+    # defense: (1) AUTO-DETECT by phantom signature (loopback IP or
+    # lifetime < threshold with no model/firmware reported) — this catches
+    # every test registration without chasing names; (2) the manual
+    # node_ignore_list as a supplementary escape hatch for edge cases.
+    # Auto-detect is the primary mechanism so the roster stays clean
+    # across deployments without config edits.
+    "phantom_min_lifetime_seconds": 120,
     "node_ignore_list": [],
 }
 
@@ -1111,9 +1148,12 @@ def channel_health(c, report=True):
     nodes = []
     try:
         for r in c.execute(
-                "SELECT node_id, MAX(last_seen) last_seen FROM nodes "
-                "GROUP BY node_id ORDER BY last_seen DESC"):
+                "SELECT node_id, first_seen, last_seen, last_ip, model, "
+                "firmware FROM nodes ORDER BY last_seen DESC"):
             if r["node_id"] in ignore:
+                continue
+            if _is_phantom_node(r["first_seen"], r["last_seen"],
+                                r["last_ip"], r["model"], r["firmware"]):
                 continue
             dt = _parse_ts(r["last_seen"])
             age = (now - dt).total_seconds() if dt else None
@@ -2319,6 +2359,9 @@ def _where_print_node(c, q):
         "FROM nodes WHERE lower(node_id) = lower(?)", (q,)).fetchone()
     if not row:
         return False
+    if _is_phantom_node(row["first_seen"], row["last_seen"],
+                        row["last_ip"], row["model"], row["firmware"]):
+        return False  # phantom — treat as not found
     now = datetime.now(timezone.utc)
     dt = _parse_ts(row["last_seen"])
     age = (now - dt).total_seconds() if dt else None
@@ -2389,8 +2432,12 @@ def _where_prefix(c, q):
     for d in _named_devices(c):
         if d["name"].lower().startswith(ql):
             cands.append(("device", d["name"]))
-    for r in c.execute("SELECT DISTINCT node_id FROM nodes"):
+    for r in c.execute("SELECT DISTINCT node_id, first_seen, last_seen, "
+                       "last_ip, model, firmware FROM nodes"):
         if r["node_id"].lower().startswith(ql):
+            if _is_phantom_node(r["first_seen"], r["last_seen"],
+                                r["last_ip"], r["model"], r["firmware"]):
+                continue
             cands.append(("node", r["node_id"]))
     cands = sorted(set(cands))
     if not cands:
@@ -2452,7 +2499,10 @@ def where_view(c, label):
                            if isinstance(info, dict)
                            and (lbl := info.get("label"))})
     known_nodes = [r["node_id"] for r in c.execute(
-        "SELECT DISTINCT node_id FROM nodes ORDER BY node_id")]
+        "SELECT node_id, first_seen, last_seen, last_ip, model, firmware "
+        "FROM nodes ORDER BY node_id")
+        if not _is_phantom_node(r["first_seen"], r["last_seen"],
+                                r["last_ip"], r["model"], r["firmware"])]
     print(f"No label '{q}' in the devices table, places, or node registry.")
     if known_devs:
         print(f"  Known device labels: {', '.join(known_devs)}")
