@@ -36,6 +36,14 @@ you want to use it for.
   other scanners forget.
 - **Smart-home automation** — "you're home" triggers scenes from RF presence,
   not phone GPS or app state. The room knows when you're actually in it.
+- **Pet wellness station** *(flagship example app)* — a stationary orb watches
+  your cat or dog through radio alone: no collar, no camera, no wearables.
+  It learns the pet's personal behavior baseline (nap spots + hours, activity
+  rhythm, food-bowl circuits) and flags deviations — stress signals after the
+  owner leaves (pacing spike), drift over long absences, reunion reactions, and
+  early signs of illness (hiding, reduced movement) days before visible
+  symptoms. Explainable pattern math, not black-box AI. See
+  [pet-wellness-station spec](#pet-wellness-station---example-application-spec).
 
 ## What's inside
 
@@ -205,6 +213,49 @@ python3 mosaic_mcp.py    # or wire into your MCP client
   (entities, chains, places), MCP server
 - **Next:** CSI sensing (body presence/vitals on S3), network-layer identity
   feed (ARP), entity persistence across runs, multi-node swarm
+
+## Pet wellness station — example application spec
+
+A concrete product built on the mosaic stack. Everything below is buildable
+with the current firmware + gateway + anomaly-engine design.
+
+**The product:** a stationary radio puck with a round screen + phone app. Plug
+it in, pair it, leave it. It watches the pet's life through radio alone and
+tells the owner: *normal / stressed / something's off* — based on the pet's
+own learned baseline. No collar, no camera, no wearables.
+
+**Why this works technically:**
+- CSI + BLE presence detect a pet-sized body (4+ kg) moving through the room —
+  presence, movement intensity, location-over-time are all measurable
+- The pattern layer (per-hour-of-day activity, 7-day decay) learns the pet's
+  personal rhythm: nap spots + hours, activity windows, food-bowl circuits
+- The anomaly engine flags deviations from that baseline
+
+**What it measures (all from existing data):**
+| Signal | Meaning |
+|--------|---------|
+| Departure spike | movement burst right after owner leaves (pacing = separation response) |
+| Absence drift | activity/appetite rhythm shifts over days 1-3 of an absence |
+| Reunion reaction | movement burst correlated with owner's device re-entering range |
+| Rhythm changes | nap spots, activity windows, night behavior vs baseline |
+| Lethargy trend | reduced movement amplitude over days — early illness signal |
+
+**Key properties:**
+- **No AI magic** — explainable pattern math on real radio data
+- **No wearables** — the pet wears nothing
+- **No camera** — privacy-positive; radio presence, no footage
+- **Simple hardware** — stationary: no battery, no case engineering, no mobile
+  ergonomics. One ESP32-class board + round AMOLED + gateway
+- **Market position** — adjacent to Furbo/Petcube camera feeders but delivers
+  health/behavior insight they can't, at lower BOM (no camera, no video cloud)
+
+**Build roadmap (squad):**
+1. ✅ CSI presence + motion (Phase 1)
+2. ✅ Breathing band + pattern-layer seed (Phase 2)
+3. 🔄 Wander calibration (quiet-window + adaptive threshold)
+4. ⬜ Pet baseline profiles (per-pet, place-memories per BSSID)
+5. ⬜ Anomaly flags: departure spike / absence drift / reunion reaction
+6. ⬜ Phone app: stats, daily report, "what changed" view
 
 ## Built with / Inspired by
 
