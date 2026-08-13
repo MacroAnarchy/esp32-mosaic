@@ -12,6 +12,7 @@
 # esp_lcd CO5300 driver (esp_lcd_co5300) is no longer used.
 idf_component_register(
     SRCS "main_ui.c" "display_face.cpp" "fx/fx_glow.cpp" "touch_gestures.cpp"
+         "orb_pmu.cpp" "port_axp2101.cpp" "settings_menu.cpp" "orb_ota.cpp"
     INCLUDE_DIRS "."
     REQUIRES sense M5GFX cst9217 esp_driver_i2c
 )
