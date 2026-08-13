@@ -206,6 +206,20 @@ python3 mosaic_mcp.py    # or wire into your MCP client
 - **Next:** CSI sensing (body presence/vitals on S3), network-layer identity
   feed (ARP), entity persistence across runs, multi-node swarm
 
+## Built with / Inspired by
+
+- **M5Stack M5StopWatch-Flux** (MIT) — display HAL foundation (Panel_CO5300
+  over M5GFX); the orb's face rendering is ported from it
+- **Espressif esp-csi / esp_wifi_sensing / esp-radar** (Apache-2.0) — official
+  CSI toolkit + sensing pipeline
+- **RuView (ruvnet)** — research reference for through-wall presence and
+  vitals pipelines
+- **DeFall (Hu et al., IEEE INFOCOM 2020)** — burst+stillness fall detection
+  algorithm basis
+- **ESP32Marauder** — OUI/vendor identification patterns (reference only)
+
+Full component + license list: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
 ## License
 
 MIT — go build things.
