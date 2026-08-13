@@ -329,7 +329,7 @@ static esp_err_t mosaic_panel_init(void)
     esp_lcd_panel_io_handle_t io = NULL;
     esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(
         MOSAIC_PANEL_CS, NULL, NULL);
-    io_config.trans_queue_depth = 4;
+    io_config.trans_queue_depth = 1;  /* synchronous: prevents DMA band race */
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)MOSAIC_PANEL_SPI_HOST,
                                    &io_config, &io);
     if (ret != ESP_OK) {
@@ -374,12 +374,9 @@ static esp_err_t mosaic_panel_init(void)
         return ret;
     }
 
-    /* CO5300 GRAM is taller than the visible 466×466 round area; the
-     * physical center sits 70 rows below the GRAM origin. Without the
-     * y-gap every implementation renders ~70px too high. The known-good
-     * value across the ecosystem is 70.
-     */
-    esp_lcd_panel_set_gap(s_panel, 0x06, 70);
+    /* Waveshare reference: xStart=6, yStart=0. Matches both the
+     * Arduino_GFX constructor and the orb-csi-test firmware. */
+    esp_lcd_panel_set_gap(s_panel, 0x06, 0);
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     esp_lcd_panel_disp_on_off(s_panel, true);
@@ -416,17 +413,13 @@ esp_err_t display_face_init(void)
         /* continue: state machine still runs, flush is a no-op */
     }
 
-    /* Persistent DMA band — one 59KB block, allocated ONCE in internal
-     * DMA-capable RAM. The esp_lcd SPI io does NOT set
-     * SPI_TRANS_DMA_USE_PSRAM, so a PSRAM band would be copied into
-     * internal RAM per transaction anyway (and that alloc fails when
-     * WiFi is active). Internal band = zero priv-TX allocation ever.
-     * WiFi TX buffers are dynamic (see sdkconfig.defaults.ui) so this
-     * 59KB stays affordable. */
+    /* Persistent DMA band — one 59KB internal-RAM block, allocated ONCE.
+     * Without it the SPI driver allocates a priv TX buffer per band
+     * transaction and internal RAM fragments until a frame dies. */
     if (s_dmaBand == NULL) {
         s_dmaBand = (uint16_t *)heap_caps_malloc(
             (size_t)kBandRows * kScreenW * sizeof(uint16_t),
-            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            MALLOC_CAP_DMA);
         if (s_dmaBand == NULL) {
             ESP_LOGE(TAG, "DMA band alloc failed — display will freeze");
         } else {
@@ -815,24 +808,6 @@ static void render_center(float gain)
     s_canvas.addGlowDot(kCenterX, kCenterY, { 255, 255, 255 },
                         0.55f + 0.25f * pulse, 3);
 
-    /* CALIBRATION OVERLAY — first 90 frames (~2.7s): center dot, crosshair,
-     * and the assumed visible-circle edge. Shows where the software thinks
-     * the panel center is, vs the physical glass. */
-    if (s_frame < 90) {
-        for (int a = 0; a < 360; a++) {
-            float ang = (float)a / 360.0f * 6.2831853f;
-            s_canvas.addGlowDot(kCenterX + cosf(ang) * 226.0f,
-                                kCenterY + sinf(ang) * 226.0f,
-                                { 255, 255, 255 }, 0.9f, 2);
-            s_canvas.addGlowDot(kCenterX + cosf(ang) * 113.0f,
-                                kCenterY + sinf(ang) * 113.0f,
-                                { 120, 200, 255 }, 0.5f, 2);
-        }
-        for (int d = -200; d <= 200; d += 20) {
-            s_canvas.addGlowDot(kCenterX + d, kCenterY, { 255, 255, 255 }, 0.7f, 2);
-            s_canvas.addGlowDot(kCenterX, kCenterY + d, { 255, 255, 255 }, 0.7f, 2);
-        }
-    }
 }
 
 /* The orbs: one per device, MAC-stable angle, RSSI-driven radius,
@@ -993,26 +968,18 @@ static void render_dome(face_state_t state)
 {
     /* State overlays: the dome is the base, states tint/boost it. */
     float gain = 1.0f;
-    float sweepSpeed = 0.020f;
     if (state == FACE_SLEEP) {
         gain = 0.10f;
-    } else if (state == FACE_ALERT) {
-        sweepSpeed = 0.052f;   /* agitated: fast sweep */
     }
     float voiceEnergy = 0.0f;
     if (state == FACE_VOICE) {
         voiceEnergy = s_voice_energy;
-        sweepSpeed += 0.05f * voiceEnergy;
     }
 
     int deviceCount = dome_refresh();
-    s_sweepAngle += sweepSpeed;
-    if (s_sweepAngle > 6.28318f) s_sweepAngle -= 6.28318f;
 
     const FaceStyle &st = kStyles[state];
     render_dust(st, deviceCount, gain);
-    render_rings(s_sweepAngle, gain);
-    render_sweep(gain);
     render_pool(gain);          /* streams + bursts + implosions */
     render_orbs(state, gain);
     render_center(gain);
