@@ -68,9 +68,32 @@ typedef struct sense_csi_features {
     bool moved;          /* channel in ACTIVE/DEBOUNCE_ACTIVE (motion now) */
     bool presenceReady;  /* per-channel presence window has enough samples */
     bool trainValid;     /* presence calibration thresholds cached */
+    /* Phase 2 — breathing-band energy from a 32s PSRAM ring buffer of the
+     * jitter feature stream, band-pass filtered 0.2-0.5 Hz (human breathing).
+     * breathingEnergy = normalised 0..1 power in the breathing band relative
+     *   to total AC power. Honest: a cat's RCS is 20-30dB weaker than a
+     *   human's, so on this orb the metric is a room-level breathing-band
+     *   indicator, not a cat vital sign (see mosaic-research.md line 880).
+     * breathingRateHz  = peak frequency in the band (0.0 when insufficient
+     *   data or no clear peak). 0.2-0.5 Hz = 12-30 breaths/min.
+     * breathingSamples = number of samples in the analysis window (0..160).
+     *   When < CSI_BREATHING_MIN_SAMPLES the metrics read 0 and the UI
+     *   should render the calibration-wait state. */
+    float breathingEnergy;  /* 0..1 normalised band-power ratio */
+    float breathingRateHz;  /* peak frequency 0.2-0.5 Hz, or 0.0 */
+    uint16_t breathingSamples; /* samples in window (0..CSI_BREATHING_WIN) */
     uint32_t updatedMs;  /* sense uptime ms of the last cached sample */
     uint32_t sampleId;   /* monotonic sample counter (detect fresh data) */
 } sense_csi_features_t;
+
+/* Breathing pipeline constants (also used by the face renderer). 5 Hz sample
+ * rate × 32 s window = 160 samples. Band: 0.2-0.5 Hz (12-30 breaths/min). */
+#define CSI_BREATHING_SAMPLE_HZ      5
+#define CSI_BREATHING_WINDOW_SE       32
+#define CSI_BREATHING_WIN            (CSI_BREATHING_SAMPLE_HZ * CSI_BREATHING_WINDOW_SE)
+#define CSI_BREATHING_MIN_SAMPLES     75   /* 15 s — below this, no estimate */
+#define CSI_BREATHING_BAND_LOW_HZ    0.2f
+#define CSI_BREATHING_BAND_HIGH_HZ   0.5f
 
 bool sense_engine_get_csi_features(sense_csi_features_t *out);
 

@@ -2514,6 +2514,142 @@ def where_view(c, label):
           "'owner' aliases the owner group, raw MACs resolve too.")
 
 
+def csi_patterns(c, hours=168):
+    """Phase 2 pattern-layer seed: per-hour-of-day presence/motion counts
+    from csi_events, with a 7-day exponential decay. The start of the
+    "learn the normal" baseline.
+
+    Shows typical activity by hour (7-day weighted average) vs today's
+    activity so far. Breathing-band energy stats per hour too (Phase 2).
+    """
+    now = datetime.now(timezone.utc)
+    # 7-day decay: weight = 0.5^(age_days/7). Queries the raw csi_events.
+    # hour-of-day = CAST(strftime('%H', received_at) AS INTEGER)
+    # We compute the weighted presence/motion counts per hour bucket.
+    # NOTE: breathing columns may not exist yet (pre-Phase 2 DB). Try with
+    # them, fall back to without.
+    try:
+        rows = c.execute("""
+            SELECT CAST(strftime('%H', received_at) AS INTEGER) AS hod,
+                   event, someone, moved, breathing_energy,
+                   breathing_rate_hz, breathing_samples,
+                   received_at
+            FROM csi_events
+            WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
+        """, (f"-{hours} hours",)).fetchall()
+    except sqlite3.OperationalError:
+        rows = c.execute("""
+            SELECT CAST(strftime('%H', received_at) AS INTEGER) AS hod,
+                   event, someone, moved, NULL AS breathing_energy,
+                   NULL AS breathing_rate_hz, NULL AS breathing_samples,
+                   received_at
+            FROM csi_events
+            WHERE REPLACE(substr(received_at,1,19),'T',' ') > datetime('now', ?)
+        """, (f"-{hours} hours",)).fetchall()
+
+    if not rows:
+        print("csi-patterns: no csi_events in the lookback window.")
+        return
+
+    # Build per-hour weighted stats.
+    from collections import defaultdict
+    hod_data = defaultdict(lambda: {
+        "presence_count": 0.0, "motion_count": 0.0,
+        "breath_energy_sum": 0.0, "breath_energy_n": 0,
+        "breath_rate_values": [],
+        "today_presence": 0, "today_motion": 0,
+    })
+    today_str = now.strftime("%Y-%m-%d")
+
+    for r in rows:
+        hod = r["hod"]
+        rt = r["received_at"] or ""
+        # Parse age for decay weight
+        try:
+            # received_at is ISO format like 2026-08-13T14:30:00+00:00
+            evt_time = datetime.fromisoformat(rt.replace("Z", "+00:00"))
+            age_days = max(0.0, (now - evt_time).total_seconds() / 86400.0)
+        except Exception:
+            age_days = 7.0  # fallback: oldest weight
+        weight = 0.5 ** (age_days / 7.0)
+
+        d = hod_data[hod]
+        if r["someone"]:
+            d["presence_count"] += weight
+        if r["moved"]:
+            d["motion_count"] += weight
+        if r["breathing_energy"] is not None:
+            d["breath_energy_sum"] += r["breathing_energy"] * weight
+            d["breath_energy_n"] += 1
+            if r["breathing_rate_hz"] and r["breathing_rate_hz"] > 0:
+                d["breath_rate_values"].append((r["breathing_rate_hz"], weight))
+
+        # Today's actual counts (unweighted)
+        if rt.startswith(today_str):
+            if r["someone"]:
+                d["today_presence"] += 1
+            if r["moved"]:
+                d["today_motion"] += 1
+
+    # Print the pattern table
+    print(f"\n{'='*72}")
+    print(f"CSI PATTERNS — hour-of-day activity baseline (7-day decay)")
+    print(f"{'='*72}")
+    print(f"{'Hour':>4}  {'Pres(w)':>8} {'Mot(w)':>8}  {'BrE avg':>8} {'BrRate':>8}"
+          f"  {'Today P':>8} {'Today M':>8}")
+    print(f"{'-'*4}  {'-'*8} {'-'*8}  {'-'*8} {'-'*8}  {'-'*8} {'-'*8}")
+
+    total_presence = 0.0
+    total_motion = 0.0
+    for hod in range(24):
+        d = hod_data.get(hod)
+        if not d:
+            print(f"{hod:4d}  {'—':>8} {'—':>8}  {'—':>8} {'—':>8}"
+                  f"  {'—':>8} {'—':>8}")
+            continue
+        breath_avg = (d["breath_energy_sum"] / d["breath_energy_n"]
+                      if d["breath_energy_n"] > 0 else None)
+        # Weighted average breathing rate
+        if d["breath_rate_values"]:
+            total_w = sum(w for _, w in d["breath_rate_values"])
+            breath_rate = sum(r * w for r, w in d["breath_rate_values"]) / total_w if total_w > 0 else None
+        else:
+            breath_rate = None
+
+        total_presence += d["presence_count"]
+        total_motion += d["motion_count"]
+
+        def fmt(v, spec=".3f"):
+            return f"{v:{spec}}" if v is not None else "—"
+
+        print(f"{hod:4d}  {d['presence_count']:8.2f} {d['motion_count']:8.2f}"
+              f"  {fmt(breath_avg):>8} {fmt(breath_rate, '.2f'):>8}"
+              f"  {d['today_presence']:8d} {d['today_motion']:8d}")
+
+    print(f"{'─'*72}")
+    print(f"{'TOTAL':>4}  {total_presence:8.2f} {total_motion:8.2f}"
+          f"  {'':>8} {'':>8}  {'':>8} {'':>8}")
+    print(f"\nPres(w)/Mot(w) = 7-day exponentially-decayed weighted counts")
+    print(f"BrE avg = mean breathing_energy (0..1 band-power ratio)")
+    print(f"BrRate  = weighted-mean breathing_rate_hz (0.2-0.5 = 12-30 BPM)")
+    print(f"Today P/M = unweighted counts for today ({today_str})")
+    print(f"Window: last {hours}h  |  Rows: {len(rows)}")
+
+    # Quick anomaly flag: today's motion vs historical for the current hour
+    current_hod = now.hour
+    d = hod_data.get(current_hod)
+    if d and d["today_motion"] > 0:
+        # Compare today's count to the weighted historical average
+        hist_motion = d["motion_count"]
+        if hist_motion > 0 and d["today_motion"] > hist_motion * 2:
+            print(f"\n⚠  Hour {current_hod}: today's motion ({d['today_motion']})"
+                  f" is {d['today_motion']/max(hist_motion,0.01):.1f}× the 7-day"
+                  f" weighted average ({hist_motion:.2f}) — above-normal activity")
+        elif hist_motion > 0:
+            print(f"\n✓  Hour {current_hod}: today ({d['today_motion']}) vs"
+                  f" 7-day avg ({hist_motion:.2f}) — within normal range")
+
+
 def main():
     ap = argparse.ArgumentParser(description="ESP32-Mosaic world-model brain")
     ap.add_argument("--status", action="store_true", help="entity view of recent data")
@@ -2533,6 +2669,8 @@ def main():
                     help="M1: owner presence — resolve seeded owner labels through entity chains")
     ap.add_argument("--channels", action="store_true",
                     help="sensing pipeline heartbeat — per-channel + per-node liveness")
+    ap.add_argument("--csi-patterns", action="store_true",
+                    help="CSI Phase 2: per-hour-of-day presence/motion patterns with 7-day decay")
     ap.add_argument("--backfill-beacons", action="store_true",
                     help="rebuild beacon_samples from events JSON history")
     ap.add_argument("--where", metavar="LABEL",
@@ -2558,6 +2696,8 @@ def main():
         owner_view(c, args.hours)
     if args.channels:
         channel_health(c)
+    if args.csi_patterns:
+        csi_patterns(c, args.hours)
     if args.bind_slots or args.handoffs:
         analyze_handoffs(c, args.hours)
     if args.chains:
@@ -2575,8 +2715,8 @@ def main():
     if not (args.status or args.devices or args.seeds or args.seed_labels
             or args.bind_slots
             or args.handoffs or args.chains or args.lockstep or args.places
-            or args.probes or args.owner or args.channels or args.backfill_beacons
-            or args.where):
+            or args.probes or args.owner or args.channels or args.csi_patterns
+            or args.backfill_beacons or args.where):
         print_entity_view(entity_view(c, args.hours))
 
 
