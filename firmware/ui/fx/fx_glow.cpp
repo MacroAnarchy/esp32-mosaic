@@ -85,6 +85,14 @@ bool GlowCanvas::init(uint16_t** rows, FlushFn flush, void* flush_ctx)
     _flush_ctx  = flush_ctx;
     _n_dirty    = 0;
     _n_segs     = 0;
+    if (_segs == nullptr) {
+        /* No external storage handed in — fall back to an internal
+         * heap allocation (keeps .bss small; the erase list only
+         * exists while the canvas is live). */
+        _segs = (Seg*)std::malloc((size_t)kMaxSegs * sizeof(Seg));
+        _segsCap = kMaxSegs;
+        _segsOwned = (_segs != nullptr);
+    }
     _full_clear = false;
     clear();
     return true;
@@ -97,8 +105,12 @@ void GlowCanvas::deinit()
     }
     _flush      = nullptr;
     _flush_ctx  = nullptr;
-    _n_dirty    = 0;
-    _n_segs     = 0;
+    if (_segsOwned) {
+        std::free(_segs);
+        _segsOwned = false;
+    }
+    _segs = nullptr;
+    _segsCap = 0;
 }
 
 void GlowCanvas::clear()
@@ -234,7 +246,7 @@ void GlowCanvas::addGlowDot(float fx_, float fy_, const Rgb& color, float intens
 void GlowCanvas::addLine(float x0f, float y0f, float x1f, float y1f, uint8_t r, uint8_t g, uint8_t b)
 {
     int x0 = (int)x0f, y0 = (int)y0f, x1 = (int)x1f, y1 = (int)y1f;
-    if (_n_segs < kMaxSegs) {
+    if (_segs != nullptr && _n_segs < _segsCap) {
         _segs[_n_segs++] = {(int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y1};
     } else {
         _full_clear = true;
