@@ -1,0 +1,9 @@
+# Vendored M5GFX (LovyanGFX) 0.2.19 — trimmed for the Mosaic UI build.
+# Only the sources the component compiles are committed; the upstream
+# git metadata and unused assets stay local (fetch from upstream if needed).
+.git/
+examples/
+docs/
+src/picture_frame/
+src/lgfx/Fonts/efont/*.c
+src/lgfx/Fonts/IPA/*.c

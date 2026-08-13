@@ -13,8 +13,10 @@
  *   MOTION = discovery bursts fly out from center, pulse streams flow
  *            center->device while present, soft implosions on departure
  *
- * The panel is a 466x466 QSPI AMOLED (CO5300 controller) driven directly
- * through esp_lcd — no board-support package. A FreeRTOS task (core 1,
+ * The panel is a 466x466 QSPI AMOLED (CO5300 controller) driven through
+ * M5GFX (LovyanGFX) with a PSRAM framebuffer — the M5StopWatch-Flux
+ * pattern: render glow stamps straight into the framebuffer rows, flush
+ * once per frame via the fb panel's display(). A FreeRTOS task (core 1,
  * moderate priority) owns the render loop at a 33fps target. All public
  * calls are thread-safe and may be used from any task.
  *
@@ -22,16 +24,15 @@
  */
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "driver/spi_master.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_co5300.h"
+
+#include <M5GFX.h>
+#include <lgfx/v1/panel/Panel_AMOLED.hpp>
 
 #include "display_face.h"
 #include "fx/fx_glow.h"
@@ -173,9 +174,12 @@ struct VignRow {
     int16_t f1;  /* [f0, f1)     : untouched             */
     int16_t z1;  /* [f1, z1)     : falloff (right side)  */
                  /* [z1, W)      : zero                  */
+    const uint8_t *lf;  /* per-x falloff factor in [z0, f0)   */
+    const uint8_t *rf;  /* per-x falloff factor in [f1, z1)   */
 };
 static VignRow s_vign[kScreenH];
 static uint8_t s_vignFactor[512];  /* radial falloff LUT (d -> 0..255) */
+static uint8_t *s_vignFalloff = nullptr;  /* per-row factor arrays (11KB) */
 
 static void vignette_build(void)
 {
@@ -195,12 +199,17 @@ static void vignette_build(void)
         }
     }
 
+    /* Precompute the per-pixel falloff factors once. The per-frame pass is
+     * then pure integer math — sqrtf per pixel is ~13ms/frame on the S3's
+     * software float. */
+    size_t total = 0;
     for (int y = 0; y < kScreenH; y++) {
         float dy = (float)y - kCenterY;
         float dy2 = dy * dy;
         VignRow &v = s_vign[y];
         if (dy2 > rOut2) {
             v.z0 = 0; v.f0 = 0; v.f1 = kScreenW; v.z1 = kScreenW;
+            v.lf = v.rf = nullptr;
             continue;
         }
         int o = (int)sqrtf(rOut2 - dy2);   /* outer half-width */
@@ -209,187 +218,245 @@ static void vignette_build(void)
         v.f0 = (int16_t)(kCenterX - i);
         v.f1 = (int16_t)(kCenterX + i);
         v.z1 = (int16_t)(kCenterX + o);
+        total += (size_t)(v.f0 - v.z0) + (size_t)(v.z1 - v.f1);
+    }
+
+    s_vignFalloff = (uint8_t *)malloc(total ? total : 1);
+    if (s_vignFalloff != nullptr) {
+        uint8_t *p = s_vignFalloff;
+        for (int y = 0; y < kScreenH; y++) {
+            VignRow &v = s_vign[y];
+            if (v.f0 <= v.z0) {
+                v.lf = nullptr;
+            } else {
+                v.lf = p;
+                for (int x = v.z0; x < v.f0; x++) {
+                    float dx = (float)x - kCenterX;
+                    float dy = (float)y - kCenterY;
+                    int d = (int)sqrtf(dx * dx + dy * dy);
+                    if (d > 511) d = 511;
+                    *p++ = s_vignFactor[d];
+                }
+            }
+            if (v.z1 <= v.f1) {
+                v.rf = nullptr;
+            } else {
+                v.rf = p;
+                for (int x = v.f1; x < v.z1; x++) {
+                    float dx = (float)x - kCenterX;
+                    float dy = (float)y - kCenterY;
+                    int d = (int)sqrtf(dx * dx + dy * dy);
+                    if (d > 511) d = 511;
+                    *p++ = s_vignFactor[d];
+                }
+            }
+        }
     }
 }
 
-/* Soften the disc edge for the round lens. fb is the canvas's own
- * framebuffer; the mask is static so it is idempotent (dirty-rect
- * erases only ever touch content inside the disc). */
-static void vignette_apply(uint16_t *fb)
+/* Soften the disc edge for the round lens. Operates in place on the
+ * canvas's row pointers (the M5GFX panel framebuffer); the mask is
+ * static so it is idempotent (dirty-rect erases only ever touch content
+ * inside the disc). */
+static void vignette_apply(void)
 {
+    auto rows = s_canvas.rows();
     for (int y = 0; y < kScreenH; y++) {
         const VignRow &v = s_vign[y];
         if (v.z0 <= 0 && v.z1 >= kScreenW) {
             continue;  /* fully inside the disc — nothing to do */
         }
-        uint16_t *row = fb + (size_t)y * kScreenW;
+        uint16_t *row = rows[y];
         if (v.z0 > 0) {
             memset(row, 0, (size_t)v.z0 * sizeof(uint16_t));
         }
         if (v.z1 < kScreenW) {
             memset(row + v.z1, 0, (size_t)(kScreenW - v.z1) * sizeof(uint16_t));
         }
-        const float dy = (float)y - kCenterY;
-        const float dy2 = dy * dy;
-        /* left falloff band [z0, f0) */
-        for (int x = v.z0; x < v.f0; x++) {
-            float dx = (float)x - kCenterX;
-            int d = (int)sqrtf(dx * dx + dy2);
-            uint8_t f = s_vignFactor[d > 511 ? 511 : d];
-            uint16_t px = row[x];
-            int rr = ((px >> 11) & 0x1F) * f >> 8;
-            int gg = ((px >> 5) & 0x3F) * f >> 8;
-            int bb = (px & 0x1F) * f >> 8;
-            row[x] = (uint16_t)((rr << 11) | (gg << 5) | bb);
-        }
-        /* right falloff band [f1, z1) */
-        for (int x = v.f1; x < v.z1; x++) {
-            float dx = (float)x - kCenterX;
-            int d = (int)sqrtf(dx * dx + dy2);
-            uint8_t f = s_vignFactor[d > 511 ? 511 : d];
-            uint16_t px = row[x];
-            int rr = ((px >> 11) & 0x1F) * f >> 8;
-            int gg = ((px >> 5) & 0x3F) * f >> 8;
-            int bb = (px & 0x1F) * f >> 8;
-            row[x] = (uint16_t)((rr << 11) | (gg << 5) | bb);
+        if (v.lf != nullptr) {
+            /* left falloff band [z0, f0) — precomputed factors */
+            for (int x = v.z0; x < v.f0; x++) {
+                uint8_t f = v.lf[x - v.z0];
+                uint16_t px = row[x];
+                int rr = ((px >> 11) & 0x1F) * f >> 8;
+                int gg = ((px >> 5) & 0x3F) * f >> 8;
+                int bb = (px & 0x1F) * f >> 8;
+                row[x] = (uint16_t)((rr << 11) | (gg << 5) | bb);
+            }
+            /* right falloff band [f1, z1) */
+            for (int x = v.f1; x < v.z1; x++) {
+                uint8_t f = v.rf[x - v.f1];
+                uint16_t px = row[x];
+                int rr = ((px >> 11) & 0x1F) * f >> 8;
+                int gg = ((px >> 5) & 0x3F) * f >> 8;
+                int bb = (px & 0x1F) * f >> 8;
+                row[x] = (uint16_t)((rr << 11) | (gg << 5) | bb);
+            }
         }
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Panel (CO5300 QSPI AMOLED) — board bring-up wiring                  */
+/* Panel (CO5300 QSPI AMOLED) — M5GFX (LovyanGFX) framebuffer driver   */
+/*                                                                     */
+/* Ported from M5StopWatch-Flux hal_display.cpp: a Panel_CO5300 over   */
+/* lgfx::Panel_AMOLED (native CO5300 QSPI envelope: 0x02 command /     */
+/* 0x32 pixel writes) on an 80MHz quad-SPI bus, plus a PSRAM panel     */
+/* framebuffer (enableFrameBuffer). The glow canvas renders straight   */
+/* into the framebuffer rows; one display() per frame pushes the       */
+/* whole 466x466 frame over the bus. Board pins differ from M5Stack's; */
+/* there is no TE pin on this board.                                   */
 /* ------------------------------------------------------------------ */
 
-#define MOSAIC_PANEL_SPI_HOST  SPI2_HOST
-#define MOSAIC_PANEL_PCLK      GPIO_NUM_38
-#define MOSAIC_PANEL_DATA0     GPIO_NUM_4
-#define MOSAIC_PANEL_DATA1     GPIO_NUM_5
-#define MOSAIC_PANEL_DATA2     GPIO_NUM_6
-#define MOSAIC_PANEL_DATA3     GPIO_NUM_7
-#define MOSAIC_PANEL_CS        GPIO_NUM_12
-#define MOSAIC_PANEL_RST       GPIO_NUM_3
-#define MOSAIC_PANEL_TRANS_SZ  (466 * 64 * 2)   /* 64-row band: DMA-safe */
+static constexpr gpio_num_t cfg_pin_sclk = GPIO_NUM_38;
+static constexpr gpio_num_t cfg_pin_io0  = GPIO_NUM_4;
+static constexpr gpio_num_t cfg_pin_io1  = GPIO_NUM_5;
+static constexpr gpio_num_t cfg_pin_io2  = GPIO_NUM_6;
+static constexpr gpio_num_t cfg_pin_io3  = GPIO_NUM_7;
+static constexpr gpio_num_t cfg_pin_cs   = GPIO_NUM_12;
+static constexpr gpio_num_t cfg_pin_rst  = GPIO_NUM_3;
 
-static esp_lcd_panel_handle_t s_panel = NULL;
+class Panel_CO5300 : public lgfx::Panel_AMOLED {
+public:
+    Panel_CO5300(void)
+    {
+        _cfg.memory_width  = _cfg.panel_width  = 480;
+        _cfg.memory_height = _cfg.panel_height = 480;
+        _write_depth       = lgfx::color_depth_t::rgb565_2Byte;
+        _read_depth        = lgfx::color_depth_t::rgb565_2Byte;
+    }
 
-/* Persistent DMA-capable band buffer: the PSRAM canvas is not DMA-safe
- * for the SPI controller, and allocating a private TX buffer per
- * transaction fragments internal RAM until one 59KB alloc fails
- * (frozen screen after ~6 min). One pre-allocated band = zero churn. */
-static uint16_t *s_dmaBand = NULL;
-static const int kBandRows = 64;
+    const uint8_t *getInitCommands(uint8_t listno) const override
+    {
+        /* M5StopWatch-Flux sequence (list format: cmd, len, args...,
+         * delay byte when the CMD_INIT_DELAY flag is set): sleep out
+         * 150ms, interface control, tearing line on + tear line 466,
+         * brightness control on, MADCTL 0, display brightness 0xA0,
+         * display on. 0x3A (RGB565) is sent by Panel_AMOLED::
+         * setColorDepth during the LGFX init path. */
+        static constexpr uint8_t list0[] = {
+            0x11, 0 + CMD_INIT_DELAY, 150,  /* sleep out */
+            0xC4, 1, 0x80,                  /* interface control */
+            0x35, 1, 0x80,                  /* tearing effect line on */
+            0x44, 2, 0x01, 0xD2,            /* tear line = 0x1D2 == 466 */
+            0x53, 1, 0x20,                  /* brightness control on */
+            0x36, 1, 0x00,                  /* MADCTL */
+            0x51, 1, 0xA0,                  /* display brightness */
+            0x29, 0,                        /* display on */
+            0xff, 0xff                      /* end */
+        };
+        switch (listno) {
+            case 0:
+                return list0;
+            default:
+                return nullptr;
+        }
+    }
+};
 
-static void mosaic_panel_flush(uint16_t *fb)
+class MosaicDisplay : public M5GFX {
+    lgfx::Bus_SPI _bus_instance;
+    Panel_CO5300 _panel_instance;
+    bool _fb_enabled = false;
+
+public:
+    bool init_impl(bool use_reset, bool use_clear) override
+    {
+        {
+            auto cfg = _bus_instance.config();
+
+            cfg.freq_write = 80000000;
+            cfg.freq_read  = 10000000;  /* irrelevant (readable=false) */
+
+            cfg.pin_sclk = cfg_pin_sclk;
+            cfg.pin_io0  = cfg_pin_io0;
+            cfg.pin_io1  = cfg_pin_io1;
+            cfg.pin_io2  = cfg_pin_io2;
+            cfg.pin_io3  = cfg_pin_io3;
+
+            cfg.spi_host    = SPI2_HOST;
+            cfg.spi_mode    = 0;  /* SPI_MODE0 */
+            cfg.spi_3wire   = true;
+            cfg.dma_channel = SPI_DMA_CH_AUTO;
+
+            _bus_instance.config(cfg);
+            _panel_instance.setBus(&_bus_instance);
+        }
+
+        {
+            auto cfg = _panel_instance.config();
+
+            cfg.pin_rst      = cfg_pin_rst;
+            cfg.pin_cs       = cfg_pin_cs;
+            cfg.panel_width  = 468;
+            cfg.panel_height = 466;
+            cfg.offset_x     = 6;  /* confirmed centering — do not change */
+            cfg.offset_y     = 0;
+            cfg.readable     = false;
+
+            _panel_instance.config(cfg);
+        }
+
+        setPanel(&_panel_instance);
+
+        if (!LGFX_Device::init_impl(use_reset, use_clear)) {
+            return false;
+        }
+
+        enableFrameBuffer(true);
+
+        _panel_instance.setBrightness(128);
+
+        return true;
+    }
+
+    bool enableFrameBuffer(bool auto_display = false)
+    {
+        _fb_enabled = false;
+        if (_panel_instance.initPanelFb()) {
+            auto fbPanel = _panel_instance.getPanelFb();
+            if (fbPanel) {
+                fbPanel->setBus(&_bus_instance);
+                fbPanel->setAutoDisplay(auto_display);
+                setPanel(fbPanel);
+                _fb_enabled = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool fbEnabled() const { return _fb_enabled; }
+};
+
+static MosaicDisplay *s_display = nullptr;
+
+/* After enableFrameBuffer() the active panel is the framebuffer panel
+ * (Panel_AMOLED_Framebuffer) — the glow canvas renders into its rows
+ * and the flush pushes via its display(). */
+static lgfx::Panel_FrameBufferBase *fb_panel(void)
 {
-    if (s_panel == NULL || s_dmaBand == NULL) {
+    if (s_display == nullptr || !s_display->fbEnabled()) {
+        return nullptr;
+    }
+    return static_cast<lgfx::Panel_FrameBufferBase *>(s_display->getPanel());
+}
+
+static void mosaic_panel_flush(void *ctx)
+{
+    (void)ctx;
+    if (s_display == nullptr) {
         return;
     }
     /* Round cutout: soften the disc edge once per frame, in place. */
-    vignette_apply(fb);
-    /* Push 64-row bands through the persistent DMA buffer — the CO5300
-     * accepts partial y-ranges, and the copy is cheap (~59KB memcpy). */
-    for (int y = 0; y < kScreenH; y += kBandRows) {
-        int rows = kBandRows;
-        if (y + rows > kScreenH) {
-            rows = kScreenH - y;
-        }
-        memcpy(s_dmaBand, fb + (size_t)y * kScreenW,
-               (size_t)rows * kScreenW * sizeof(uint16_t));
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y, kScreenW, y + rows,
-                                  s_dmaBand);
+    vignette_apply();
+    /* Push the whole 466x466 frame from the PSRAM framebuffer over QSPI.
+     * The fb panel's display() handles the 0x32 pixel-write envelope,
+     * per-line DMA double buffering and the GRAM offset (offset_x=6). */
+    auto fb = fb_panel();
+    if (fb != nullptr) {
+        fb->display(0, 0, kScreenW, kScreenH);
     }
-}
-
-static esp_err_t mosaic_panel_init(void)
-{
-    esp_err_t ret;
-
-    /* Build the QSPI bus config manually in declaration order.
-     * The dataN names are union aliases; C++ designator order requires
-     * the FIRST member of each anonymous union (mosi/miso/quadwp/quadhd).
-     * Same memory, QSPI mode. */
-    const spi_bus_config_t buscfg = {
-        .mosi_io_num = MOSAIC_PANEL_DATA0,
-        .miso_io_num = MOSAIC_PANEL_DATA1,
-        .sclk_io_num = MOSAIC_PANEL_PCLK,
-        .quadwp_io_num = MOSAIC_PANEL_DATA2,
-        .quadhd_io_num = MOSAIC_PANEL_DATA3,
-        .data4_io_num = -1,
-        .data5_io_num = -1,
-        .data6_io_num = -1,
-        .data7_io_num = -1,
-        .max_transfer_sz = MOSAIC_PANEL_TRANS_SZ,
-    };
-    ret = spi_bus_initialize(MOSAIC_PANEL_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "spi bus init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    esp_lcd_panel_io_handle_t io = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(
-        MOSAIC_PANEL_CS, NULL, NULL);
-    io_config.trans_queue_depth = 1;  /* synchronous: prevents DMA band race */
-    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)MOSAIC_PANEL_SPI_HOST,
-                                   &io_config, &io);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "panel io init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    /* CO5300 init sequence from the Waveshare BSP (board bring-up). */
-    static const co5300_lcd_init_cmd_t init_cmds[] = {
-        {0xFE, (uint8_t[]){0x20}, 1, 0},
-        {0x19, (uint8_t[]){0x10}, 1, 0},
-        {0x1C, (uint8_t[]){0xA0}, 1, 0},
-        {0xFE, (uint8_t[]){0x00}, 1, 0},
-        {0xC4, (uint8_t[]){0x80}, 1, 0},
-        {0x3A, (uint8_t[]){0x55}, 1, 0},   /* RGB565 */
-        {0x35, (uint8_t[]){0x00}, 1, 0},
-        {0x53, (uint8_t[]){0x20}, 1, 0},   /* brightness ctrl on */
-        {0x51, (uint8_t[]){0xFF}, 1, 0},   /* brightness 100% */
-        {0x63, (uint8_t[]){0xFF}, 1, 0},
-        {0x2A, (uint8_t[]){0x00, 0x06, 0x01, 0xD7}, 4, 0}, /* col 6..471 */
-        {0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0xD1}, 4, 600},/* row 0..465 */
-        {0x11, NULL, 0, 600},              /* sleep out */
-        {0x29, NULL, 0, 0},                /* display on */
-    };
-    co5300_vendor_config_t vendor_config = {
-        .init_cmds = init_cmds,
-        .init_cmds_size = sizeof(init_cmds) / sizeof(init_cmds[0]),
-        .flags = {
-            .use_qspi_interface = 1,
-        },
-    };
-
-    const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = MOSAIC_PANEL_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 16,
-        .vendor_config = &vendor_config,
-    };
-    ret = esp_lcd_new_panel_co5300(io, &panel_config, &s_panel);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "co5300 panel init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    /* Waveshare reference: xStart=6, yStart=0. Matches both the
-     * Arduino_GFX constructor and the orb-csi-test firmware. */
-    esp_lcd_panel_set_gap(s_panel, 0x06, 0);
-    esp_lcd_panel_reset(s_panel);
-    esp_lcd_panel_init(s_panel);
-    esp_lcd_panel_disp_on_off(s_panel, true);
-    ESP_LOGI(TAG, "CO5300 panel ready (466x466 QSPI RGB565)");
-    return ESP_OK;
-}
-
-static void flush_cb(void *ctx, const uint16_t *fb)
-{
-    (void)ctx;
-    /* The vignette masks the canvas's own framebuffer in place (round
-     * cutout softness) — the canvas owns it and never reads it back. */
-    mosaic_panel_flush(const_cast<uint16_t *>(fb));
 }
 
 /* ------------------------------------------------------------------ */
@@ -405,30 +472,33 @@ esp_err_t display_face_init(void)
         }
     }
 
-    /* Board bring-up: bring the CO5300 panel up first. */
-    esp_err_t ret = mosaic_panel_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "panel init failed (%s) — face renders framebuffer only",
-                 esp_err_to_name(ret));
+    /* Board bring-up: bring the CO5300 panel up through M5GFX with a
+     * PSRAM framebuffer (the StopWatch-Flux pattern). */
+    s_display = new MosaicDisplay();
+    if (s_display == nullptr || !s_display->init()) {
+        ESP_LOGE(TAG, "M5GFX display init failed — face renders framebuffer only");
+        delete s_display;
+        s_display = nullptr;
         /* continue: state machine still runs, flush is a no-op */
     }
 
-    /* Persistent DMA band — one 59KB internal-RAM block, allocated ONCE.
-     * Without it the SPI driver allocates a priv TX buffer per band
-     * transaction and internal RAM fragments until a frame dies. */
-    if (s_dmaBand == NULL) {
-        s_dmaBand = (uint16_t *)heap_caps_malloc(
-            (size_t)kBandRows * kScreenW * sizeof(uint16_t),
-            MALLOC_CAP_DMA);
-        if (s_dmaBand == NULL) {
-            ESP_LOGE(TAG, "DMA band alloc failed — display will freeze");
-        } else {
-            ESP_LOGI(TAG, "DMA band ready (%u bytes)",
-                     (unsigned)(kBandRows * kScreenW * sizeof(uint16_t)));
+    /* Hand the M5GFX panel-framebuffer row pointers to the glow canvas:
+     * it renders glow stamps straight into the panel framebuffer and the
+     * flush pushes the frame with one display() call per frame. */
+    static uint16_t *s_rows[kScreenH];  /* static: too big for app_main stack */
+    bool have_rows = false;
+    auto fb = fb_panel();
+    if (fb != nullptr) {
+        auto lines = fb->getLinesBuffer();
+        if (lines != nullptr) {
+            for (int y = 0; y < kScreenH; y++) {
+                s_rows[y] = (uint16_t *)lines[y];
+            }
+            have_rows = true;
         }
     }
 
-    if (!s_canvas.init(nullptr, 0, flush_cb, nullptr)) {
+    if (!s_canvas.init(have_rows ? s_rows : nullptr, mosaic_panel_flush, nullptr)) {
         ESP_LOGE(TAG, "glow canvas init failed");
         return ESP_FAIL;
     }

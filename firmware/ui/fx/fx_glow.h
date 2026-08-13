@@ -6,8 +6,9 @@
  * additive-blended integer glow stamps, erase only the previous frame's
  * dirty regions, then flush the whole frame once (33fps target on the
  * 466x466 QSPI AMOLED). No LVGL, no M5GFX, no display driver headers:
- * the engine works on a plain uint16_t row buffer + an optional flush
- * callback (the owner wires it to esp_lcd_panel_draw_bitmap or similar).
+ * the engine works on a plain uint16_t row-pointer array + an optional
+ * flush callback (the owner hands it the M5GFX panel-framebuffer rows and
+ * wires the flush to the fb panel's display()).
  *
  * Threading contract: all draw calls must come from one render task.
  */
@@ -35,21 +36,22 @@ struct Rgb {
 
 Rgb lerpRgb(const Rgb& a, const Rgb& b, float t);
 
-/* Flush hook: called once per frame after rendering. fb points at the
- * framebuffer (kScreenW * kScreenH uint16_t RGB565, row-major). */
-using FlushFn = void (*)(void* ctx, const uint16_t* fb);
+/* Flush hook: called once per frame after rendering. The owner pushes the
+ * canvas rows to the panel (M5GFX fb panel display(), or similar). */
+using FlushFn = void (*)(void* ctx);
 
 class GlowCanvas {
 public:
     static constexpr int kMaxGlowRadius = 56;
 
-    /* fb==nullptr -> the canvas allocates its own buffer (caller frees with
-     * fb_free() afterwards; on ESP-IDF builds this lands in PSRAM via the
-     * allocator). fb_bytes is only checked when fb != nullptr. */
-    bool init(uint16_t* fb, size_t fb_bytes, FlushFn flush, void* flush_ctx);
+    /* rows: kScreenH row pointers into an RGB565 framebuffer — e.g. the
+     * M5GFX panel framebuffer's lines (Panel_FrameBufferBase::getLinesBuffer).
+     * The canvas never owns the buffer. rows==nullptr -> init fails. */
+    bool init(uint16_t** rows, FlushFn flush, void* flush_ctx);
     void deinit();
 
-    uint16_t* fb() const { return _fb; }
+    /* The attached row pointers (for in-place post-pass, e.g. vignette). */
+    uint16_t* const* rows() const { return _rows; }
     int width() const { return kScreenW; }
     int height() const { return kScreenH; }
 
@@ -69,16 +71,13 @@ public:
         if ((unsigned)x >= (unsigned)kScreenW || (unsigned)y >= (unsigned)kScreenH) {
             return;
         }
-        add_px(_fb + (size_t)y * kScreenW + x, r, g, b);
+        add_px(_rows[y] + x, r, g, b);
     }
 
     /* Additive glow dot with precomputed falloff stamp, radius 1..56. */
     void addGlowDot(float x, float y, const Rgb& color, float intensity, int radius);
     /* Additive line (motion trails). */
     void addLine(float x0, float y0, float x1, float y1, uint8_t r, uint8_t g, uint8_t b);
-
-    /* Free a buffer that init() allocated internally. */
-    static void fb_free(uint16_t* fb);
 
 private:
     static inline void add_px(uint16_t* p, uint8_t r, uint8_t g, uint8_t b)
@@ -93,8 +92,7 @@ private:
         *p          = (uint16_t)((rr << 11) | (gg << 5) | bb);
     }
 
-    uint16_t* _fb       = nullptr;
-    bool _owns_fb       = false;
+    uint16_t* _rows[kScreenH] = {nullptr};
     FlushFn _flush      = nullptr;
     void* _flush_ctx    = nullptr;
     bool _full_clear    = true;  // dirty overflow fallback

@@ -4,8 +4,8 @@
  * "PRESENCE becomes light." A particle field rendered with a direct
  * framebuffer glow engine (see fx/fx_glow.h) whose density, color and
  * motion are driven by the brain state. The panel is a 466x466 QSPI
- * AMOLED (CO5300 controller) driven directly through esp_lcd — no
- * board-support package, so the module builds on any CO5300 AMOLED.
+ * AMOLED (CO5300 controller) driven through M5GFX (LovyanGFX) with a
+ * PSRAM framebuffer — the StopWatch-Flux pattern.
  *
  * A FreeRTOS task (core 1, moderate priority) owns the render loop at
  * a 33fps target. All public calls are thread-safe and may be used

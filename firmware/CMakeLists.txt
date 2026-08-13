@@ -2,8 +2,8 @@
 # PlatformIO env; the Arduino [env:esp32] env does not use CMake).
 #
 # The app component is the env's src_dir (ui/) — PlatformIO registers it
-# via EXTRA_COMPONENT_DIRS. The panel driver is vendored next to the UI
-# sources (ui/components/esp_lcd_co5300), so it is added to
+# via EXTRA_COMPONENT_DIRS. The display library (M5GFX) is vendored next
+# to the UI sources (ui/components/M5GFX), so ui/components is added to
 # EXTRA_COMPONENT_DIRS here. The sense engine is a project component
 # (components/sense) and is picked up automatically from this dir.
 
