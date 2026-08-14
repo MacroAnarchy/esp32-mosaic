@@ -1772,7 +1772,9 @@ def lockstep_pairs(c, hours=24, report=True):
         s["global_gaps"] = sum(1 for _ga, frac in tagged if frac >= gap_global_frac)
 
     def fmt_ts(iso):
-        return iso[11:19] if iso else "-"
+        # MM-DD HH:MM — date-inclusive so cross-midnight spans don't look
+        # backwards (time-only showed e.g. 04:17→04:16 for a 24h window)
+        return f"{iso[5:10]} {iso[11:16]}" if iso and len(iso) >= 16 else "-"
 
     if report:
         print(f"\nIDENTITY STREAMS ({len(streams)} — rotating identities, {hours}h window):")
@@ -1844,7 +1846,7 @@ def lockstep_pairs(c, hours=24, report=True):
             print(f"  B: #{streams.index(B)} {B['n']} MACs co={B['company']} class={B['cls']} "
                   f"avg={B['avg']:.1f} cadence={B['cadence_s']/60:.1f}min {fmt_ts(B['first'])}→{fmt_ts(B['last'])}")
             for ga in shared[:4]:
-                print(f"     shared absence: {ga[0].strftime('%H:%M')}→{ga[1].strftime('%H:%M')} "
+                print(f"     shared absence: {ga[0].strftime('%m-%d %H:%M')}→{ga[1].strftime('%m-%d %H:%M')} "
                       f"({int((ga[1]-ga[0]).total_seconds()//60)}min) — left together")
             print(f"     level Δ={abs(A['avg']-B['avg']):.1f}dB · cadence ratio={ratio:.2f} · "
                   f"rotation alignment {al}/{tot} within {align_win//60}min (beat-drifts) → ONE object, 2 slots")
