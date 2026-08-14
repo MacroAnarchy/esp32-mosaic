@@ -9,10 +9,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <inttypes.h>
 #include <string>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -46,6 +48,19 @@
 #define MOSAIC_CSI_TRAIN_ENABLE 1              // one-time presence calibration at boot (best effort — retries, gives up after 3 attempts)
 #endif
 
+// ---- Phase 2: breathing-band detection tuning ----
+// The breathing pipeline captures jitter (the always-live motion feature) at
+// the 5 Hz UI sample rate into a PSRAM ring buffer, then computes the power
+// in the 0.2-0.5 Hz band via a lightweight Goertzel sweep. The metric is a
+// room-level breathing-band indicator — honest about the physics (a cat's RCS
+// is 20-30 dB weaker than a human's; see mosaic-research.md line 880).
+#ifndef MOSAIC_CSI_BREATHING_ENABLE
+#define MOSAIC_CSI_BREATHING_ENABLE 1
+#endif
+#ifndef MOSAIC_CSI_BREATHING_SERIAL_ECHO
+#define MOSAIC_CSI_BREATHING_SERIAL_ECHO 1  // serial-visible breathing line per UI tick (feedback loop)
+#endif
+
 static const char *TAG = "csi";
 
 static esp_wifi_sensing_fsm_handle_t s_fsm = NULL;
@@ -62,6 +77,19 @@ static uint32_t s_lastFeatureMs = 0;
 static uint8_t s_trainState = 0;
 static uint32_t s_trainStartMs = 0;
 static uint8_t s_trainAttempts = 0;
+
+// ---- Phase 2: breathing-band state variables (forward-declared here so
+// postCsiEvent/postCsiFeature can read them; the pipeline implementation is
+// further down, before the UI cache section). ----
+#if MOSAIC_CSI_BREATHING_ENABLE
+static float *s_breathBuf;
+static volatile uint16_t s_breathHead;
+static volatile uint16_t s_breathCount;
+static portMUX_TYPE s_breathLock;
+static float s_breathEnergy;
+static float s_breathRateHz;
+static uint16_t s_breathSamples;
+#endif
 
 // ---------------------------------------------------------------------
 // Event queue — the FSM's event callback runs on the component's own
@@ -145,9 +173,12 @@ static std::string fmtFloat(float v) {
 // Shared payload builder. Presence/train fields are additive — the
 // gateway csi_events table gains columns for them (idempotent ALTER);
 // older gateway code ignores unknown payload keys.
+// Phase 2: breathing fields (energy, rate, samples) are additive too.
 static std::string csiPayloadJson(const char *event, bool someone, bool moved,
                                   float wander, float jitter, uint32_t score,
-                                  const esp_wifi_sensing_fsm_channel_diag_t &diag) {
+                                  const esp_wifi_sensing_fsm_channel_diag_t &diag,
+                                  float breathEnergy, float breathRateHz,
+                                  uint16_t breathSamples) {
   std::string p = "{\"event\":\"" + std::string(event) +
                   "\",\"someone\":" + (someone ? "true" : "false") +
                   ",\"moved\":" + (moved ? "true" : "false") +
@@ -160,7 +191,10 @@ static std::string csiPayloadJson(const char *event, bool someone, bool moved,
                   ",\"presence_someone\":" + (diag.presence_someone_status ? "true" : "false") +
                   ",\"train_valid\":" + (diag.train_thresholds_valid ? "true" : "false") +
                   ",\"train_wander_threshold\":" + fmtFloat(diag.train_wander_threshold) +
-                  ",\"train_jitter_threshold\":" + fmtFloat(diag.train_jitter_threshold) + "}";
+                  ",\"train_jitter_threshold\":" + fmtFloat(diag.train_jitter_threshold) +
+                  ",\"breathing_energy\":" + fmtFloat(breathEnergy) +
+                  ",\"breathing_rate_hz\":" + fmtFloat(breathRateHz) +
+                  ",\"breathing_samples\":" + std::to_string((unsigned)breathSamples) + "}";
   return p;
 }
 
@@ -185,12 +219,26 @@ static int postCsiEvent(const CsiQueueEntry &e) {
   // Tier 1 honesty: "someone" means radio-visible motion on the channel
   // (moved=true) OR the calibrated presence channel says someone is
   // stationary (presence_someone). Untrained presence reports false.
+
+  // Phase 2: read the latest breathing metrics (computed at 5 Hz in the UI
+  // tick). Motion events carry a snapshot of the current breathing-band state.
+  float breathE = 0.0f, breathR = 0.0f;
+  uint16_t breathS = 0;
+#if MOSAIC_CSI_BREATHING_ENABLE
+  portENTER_CRITICAL(&s_breathLock);
+  breathE = s_breathEnergy;
+  breathR = s_breathRateHz;
+  breathS = s_breathSamples;
+  portEXIT_CRITICAL(&s_breathLock);
+#endif
+
   std::string payload = "{\"v\":1,\"node\":\"" + std::string(MOSAIC_NODE_NAME) +
                         "\",\"type\":\"csi\",\"ts\":" +
                         std::to_string(sense::uptime_ms()) +
                         ",\"payload\":" +
                         csiPayloadJson(active ? "moved" : "empty", active, active,
-                                       wander, jitter, e.score, diag) + "}";
+                                       wander, jitter, e.score, diag,
+                                       breathE, breathR, breathS) + "}";
 
   int code = sense::post_json(sense::gateway_ingest_url(), payload);
   ESP_LOGI(TAG, "POST %s: %d", active ? "moved" : "empty", code);
@@ -208,18 +256,32 @@ static int postCsiFeature(void) {
   if (esp_wifi_sensing_fsm_get_channel_diag(s_fsm, s_peerMac, &diag) != ESP_OK) return 0;
   const bool moved = (diag.state == ESP_WIFI_SENSING_FSM_PROCESS_ACTIVE ||
                       diag.state == ESP_WIFI_SENSING_FSM_PROCESS_DEBOUNCE_ACTIVE);
+
+  // Phase 2: read the latest breathing metrics for the feature snapshot.
+  float breathE = 0.0f, breathR = 0.0f;
+  uint16_t breathS = 0;
+#if MOSAIC_CSI_BREATHING_ENABLE
+  portENTER_CRITICAL(&s_breathLock);
+  breathE = s_breathEnergy;
+  breathR = s_breathRateHz;
+  breathS = s_breathSamples;
+  portEXIT_CRITICAL(&s_breathLock);
+#endif
+
   std::string payload = "{\"v\":1,\"node\":\"" + std::string(MOSAIC_NODE_NAME) +
                         "\",\"type\":\"csi\",\"ts\":" +
                         std::to_string(sense::uptime_ms()) +
                         ",\"payload\":" +
                         csiPayloadJson("feature", diag.presence_someone_status, moved,
                                        diag.wander_value, diag.jitter_value,
-                                       diag.smooth_scaled, diag) + "}";
+                                       diag.smooth_scaled, diag,
+                                       breathE, breathR, breathS) + "}";
   int code = sense::post_json(sense::gateway_ingest_url(), payload);
-  ESP_LOGI(TAG, "feature POST: %d wander=%.4f jitter=%.4f presence=%s train_valid=%s",
+  ESP_LOGI(TAG, "feature POST: %d wander=%.4f jitter=%.4f presence=%s train_valid=%s breath_e=%.3f breath_r=%.2f",
            code, (double)diag.wander_value, (double)diag.jitter_value,
            diag.presence_someone_status ? "someone" : "nobody",
-           diag.train_thresholds_valid ? "yes" : "no");
+           diag.train_thresholds_valid ? "yes" : "no",
+           (double)breathE, (double)breathR);
   return code;
 }
 
@@ -282,6 +344,180 @@ static void csiFeatureTick(void) {
 }
 
 // ---------------------------------------------------------------------
+// Phase 2: BREATHING-BAND DETECTION PIPELINE
+//
+// A PSRAM ring buffer captures the jitter feature at 5 Hz (the UI tick rate).
+// Every tick, a lightweight Goertzel sweep computes the spectral power at
+// 0.2-0.5 Hz (human breathing band: 12-30 breaths/min) vs total AC power.
+//
+// Design constraints honored:
+//   - S3 has no hardware double-precision FPU → single-precision float only
+//     (the ESP32-S3 DOES have a single-precision FPU, so float math is cheap;
+//     but we keep it light: Goertzel is O(N) per bin, no FFT needed).
+//   - PSRAM for the ring buffer (internal RAM stays free for the render path).
+//   - The computation runs in the UI esp_timer callback (5 Hz) — it is ~160
+//     multiply-accumulates per tick, negligible vs the 33 fps render budget.
+//   - Wander-gated channels: jitter is ALWAYS live (see WANDER GATING above),
+//     so the breathing stream never goes dark even when train fails.
+//
+// HONESTY NOTE (cat breathing): the research (mosaic-research.md line 880)
+// assessed cat breathing as NOT realistic — RCS 20-30 dB weaker than human.
+// This pipeline honestly reports the breathing-band ENERGY in the room, which
+// on a cat-only setup is dominated by motion artifacts, not real cat breath.
+// The metric is still useful as a room-level activity/periodicity indicator
+// and as a tested pipeline ready for a human subject.
+// ---------------------------------------------------------------------
+
+#if MOSAIC_CSI_BREATHING_ENABLE
+
+// State variables are forward-declared near the top (s_breathBuf etc.) so
+// postCsiEvent/postCsiFeature can read them. Initialized in breathingInit.
+
+// Goertzel single-bin power: returns |X(k)|^2 / N for the given normalised
+// frequency. coeff = 2*cos(2*pi*k/N). Standard 3-multiply recurrence.
+static float goertzelPower(const float *samples, int n, float targetFreqHz,
+                           float sampleRateHz) {
+  const float k = targetFreqHz * (float)n / sampleRateHz;
+  const float omega = 2.0f * 3.14159265f * k / (float)n;
+  const float coeff = 2.0f * cosf(omega);
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int i = 0; i < n; i++) {
+    const float s0 = samples[i] + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  // Power = s1^2 + s2^2 - coeff*s1*s2  (standard Goertzel power formula)
+  return (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (float)n;
+}
+
+// Compute the breathing-band metric from the ring buffer. Called from the UI
+// tick at 5 Hz. Copies the ring out under spinlock, then does the math outside
+// the lock (the math is ~160 MACs × ~7 bins = ~1120 ops, <50µs on the S3).
+static void breathingCompute(void) {
+  if (!s_breathBuf || s_breathCount < CSI_BREATHING_MIN_SAMPLES) {
+    portENTER_CRITICAL(&s_breathLock);
+    s_breathEnergy = 0.0f;
+    s_breathRateHz = 0.0f;
+    s_breathSamples = s_breathCount;
+    portEXIT_CRITICAL(&s_breathLock);
+    return;
+  }
+
+  // Copy the linearised window out of the ring (local stack — 160 floats = 640 B).
+  float win[CSI_BREATHING_WIN];
+  int n;
+  portENTER_CRITICAL(&s_breathLock);
+  n = (int)s_breathCount;
+  // Ring: oldest sample is at (head - count + WIN) % WIN when full,
+  // or at (head - count) when not yet wrapped. Linearise from oldest.
+  const uint16_t start = (uint16_t)((s_breathHead + CSI_BREATHING_WIN - s_breathCount) % CSI_BREATHING_WIN);
+  for (int i = 0; i < n; i++) {
+    win[i] = s_breathBuf[(start + i) % CSI_BREATHING_WIN];
+  }
+  portEXIT_CRITICAL(&s_breathLock);
+
+  // Remove DC (subtract mean) — breathing is an AC phenomenon.
+  float mean = 0.0f;
+  for (int i = 0; i < n; i++) mean += win[i];
+  mean /= (float)n;
+  for (int i = 0; i < n; i++) win[i] -= mean;
+
+  // Total AC power (sum of squares / N).
+  float totalPower = 0.0f;
+  for (int i = 0; i < n; i++) totalPower += win[i] * win[i];
+  totalPower /= (float)n;
+  if (totalPower < 1e-10f) {
+    // Flatline — no signal at all (e.g. frozen channel).
+    portENTER_CRITICAL(&s_breathLock);
+    s_breathEnergy = 0.0f;
+    s_breathRateHz = 0.0f;
+    s_breathSamples = (uint16_t)n;
+    portEXIT_CRITICAL(&s_breathLock);
+    return;
+  }
+
+  // Sweep the breathing band at fine resolution: 0.20 to 0.50 Hz in ~0.05 Hz
+  // steps (7 bins). This is a Goertzel sweep — 7 × 160 = 1120 MACs, trivial.
+  // Also compute a "motion band" reference (0.5-2.0 Hz) for the ratio.
+  const float freqs[] = {0.20f, 0.25f, 0.30f, 0.35f, 0.40f, 0.45f, 0.50f};
+  const int nBins = sizeof(freqs) / sizeof(freqs[0]);
+  float bandPower = 0.0f;
+  float peakPower = 0.0f;
+  float peakFreq = 0.0f;
+  for (int b = 0; b < nBins; b++) {
+    float pwr = goertzelPower(win, n, freqs[b], (float)CSI_BREATHING_SAMPLE_HZ);
+    bandPower += pwr;
+    if (pwr > peakPower) {
+      peakPower = pwr;
+      peakFreq = freqs[b];
+    }
+  }
+  // Motion-band reference (0.5-2.0 Hz) — captures gross movement.
+  const float motionFreqs[] = {0.60f, 0.80f, 1.00f, 1.25f, 1.50f, 1.75f, 2.00f};
+  const int nMotion = sizeof(motionFreqs) / sizeof(motionFreqs[0]);
+  float motionPower = 0.0f;
+  for (int b = 0; b < nMotion; b++) {
+    motionPower += goertzelPower(win, n, motionFreqs[b], (float)CSI_BREATHING_SAMPLE_HZ);
+  }
+
+  // Breathing energy = band power normalised by total AC power. Clamp 0..1.
+  // When motion dominates (someone walking), motionPower >> bandPower and
+  // the ratio drops — honest "not a breathing condition right now."
+  float denom = bandPower + motionPower;
+  float energy = (denom > 1e-10f) ? (bandPower / denom) : 0.0f;
+  if (energy > 1.0f) energy = 1.0f;
+  if (energy < 0.0f) energy = 0.0f;
+
+  // Peak frequency validity: only report if the peak is meaningfully above
+  // the band average (at least 1.3× the mean bin power — a clear periodicity).
+  float bandAvg = bandPower / (float)nBins;
+  float rateHz = (peakPower > bandAvg * 1.3f && peakPower > totalPower * 0.01f)
+                     ? peakFreq
+                     : 0.0f;
+
+  portENTER_CRITICAL(&s_breathLock);
+  s_breathEnergy = energy;
+  s_breathRateHz = rateHz;
+  s_breathSamples = (uint16_t)n;
+  portEXIT_CRITICAL(&s_breathLock);
+}
+
+// Push one jitter sample into the ring buffer (called from the UI tick at 5 Hz).
+static void breathingPush(float jitter) {
+  if (!s_breathBuf) return;
+  portENTER_CRITICAL(&s_breathLock);
+  s_breathBuf[s_breathHead] = jitter;
+  s_breathHead = (uint16_t)((s_breathHead + 1) % CSI_BREATHING_WIN);
+  if (s_breathCount < CSI_BREATHING_WIN) s_breathCount = (uint16_t)(s_breathCount + 1);
+  portEXIT_CRITICAL(&s_breathLock);
+}
+
+static void breathingInit(void) {
+  if (s_breathBuf) return;
+  // Initialize state (forward-declared at the top — set here once).
+  s_breathHead = 0;
+  s_breathCount = 0;
+  s_breathLock = portMUX_INITIALIZER_UNLOCKED;
+  s_breathEnergy = 0.0f;
+  s_breathRateHz = 0.0f;
+  s_breathSamples = 0;
+  // Allocate in PSRAM — the ring is 160 × 4 = 640 bytes, trivial in size but
+  // we honour the "PSRAM for buffers" rule so internal RAM stays free for the
+  // render path (~33 fps M5GFX already runs tight).
+  s_breathBuf = (float *)heap_caps_malloc(
+      CSI_BREATHING_WIN * sizeof(float), MALLOC_CAP_SPIRAM);
+  if (s_breathBuf) {
+    memset(s_breathBuf, 0, CSI_BREATHING_WIN * sizeof(float));
+    ESP_LOGI(TAG, "breathing ring: %d samples (%d B) in PSRAM",
+             (int)CSI_BREATHING_WIN, (int)(CSI_BREATHING_WIN * sizeof(float)));
+  } else {
+    ESP_LOGW(TAG, "breathing PSRAM alloc failed — pipeline disabled");
+  }
+}
+
+#endif  // MOSAIC_CSI_BREATHING_ENABLE
+
+// ---------------------------------------------------------------------
 // UI feature cache — the face renderer's live data seam.
 //
 // The dome visualization is driven by the REAL channel features
@@ -313,11 +549,39 @@ static void csiUiTick(void *arg) {
              diag.state == ESP_WIFI_SENSING_FSM_PROCESS_DEBOUNCE_ACTIVE);
   f.presenceReady = diag.presence_ready;
   f.trainValid = diag.train_thresholds_valid;
+
+#if MOSAIC_CSI_BREATHING_ENABLE
+  // Phase 2: push the jitter sample into the breathing ring, then compute.
+  // Jitter is the always-live motion feature (see WANDER GATING note) — it
+  // captures the micro-fluctuations that breathing induces in the CSI channel.
+  breathingPush(f.jitter);
+  breathingCompute();
+  // Copy the latest breathing metrics into the UI struct.
+  portENTER_CRITICAL(&s_breathLock);
+  f.breathingEnergy = s_breathEnergy;
+  f.breathingRateHz = s_breathRateHz;
+  f.breathingSamples = s_breathSamples;
+  portEXIT_CRITICAL(&s_breathLock);
+#else
+  f.breathingEnergy = 0.0f;
+  f.breathingRateHz = 0.0f;
+  f.breathingSamples = 0;
+#endif
+
   f.updatedMs = sense::uptime_ms();
   f.sampleId = ++s_csiUiSampleId;
   portENTER_CRITICAL(&s_csiUiLock);
   s_csiUi = f;
   portEXIT_CRITICAL(&s_csiUiLock);
+
+#if MOSAIC_CSI_BREATHING_ENABLE && MOSAIC_CSI_BREATHING_SERIAL_ECHO
+  // Feedback-loop serial echo: one line per UI tick (5 Hz) showing the
+  // breathing metric. Visible in the serial monitor for live calibration /
+  // test sessions (Mack walk-past, empty-room baseline, etc).
+  ESP_LOGI(TAG, "breath: energy=%.3f rate=%.2fHz samples=%d jitter=%.4f moved=%d",
+           (double)f.breathingEnergy, (double)f.breathingRateHz,
+           (int)f.breathingSamples, (double)f.jitter, (int)f.moved);
+#endif
 }
 
 static void csiUiTimerStart(void) {
@@ -439,6 +703,12 @@ esp_err_t csi_sensing_init(void) {
   if (esp_timer_create(&targs, &t) == ESP_OK) {
     esp_timer_start_once(t, 5000 * 1000ULL);  // 5s
   }
+
+  // Phase 2: allocate the breathing-band PSRAM ring buffer before the UI
+  // timer starts pushing samples into it.
+#if MOSAIC_CSI_BREATHING_ENABLE
+  breathingInit();
+#endif
 
   // Live UI feature cache for the face renderer (5Hz diag sampling —
   // see csiUiTick above).

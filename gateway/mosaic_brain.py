@@ -221,26 +221,20 @@ DEFAULT_WM = {
 
 
 def load_wm():
-    """Read world_model from ~/.orb/config.yaml (deployment-local, survives
-    repo operations), falling back to gateway/config.yaml (repo, gitignored),
-    then DEFAULT_WM. The brain must always run."""
+    """Read world_model from gateway/config.yaml (mirrors orb_gateway.load_config).
+    Falls back to DEFAULT_WM when missing — the brain must always run."""
     wm = dict(DEFAULT_WM)
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.expanduser("~/.orb/config.yaml"),   # deployment-local (primary)
-        os.path.join(here, "config.yaml"),          # repo fallback (legacy)
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                import yaml
-                with open(path) as f:
-                    cfg = yaml.safe_load(f) or {}
-                wm_cfg = (cfg.get("world_model") or {}) or {}
-                wm.update({k: v for k, v in wm_cfg.items() if k in wm and v is not None})
-                break
-            except Exception:
-                continue
+    path = os.path.join(here, "config.yaml")
+    if os.path.exists(path):
+        try:
+            import yaml
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+            wm_cfg = (cfg.get("world_model") or {}) or {}
+            wm.update({k: v for k, v in wm_cfg.items() if k in wm and v is not None})
+        except Exception:
+            pass
     return wm
 
 

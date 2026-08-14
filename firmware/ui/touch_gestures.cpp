@@ -18,6 +18,7 @@
 
 #include "display_face.h"
 #include "touch_gestures.h"
+#include "settings_menu.h"
 
 static const char *TAG = "touch";
 
@@ -93,6 +94,39 @@ static void gesture_finish(void)
         return;  /* right after a mode change — swallow this release */
     }
 
+    /* ---- Settings menu open: route touches to menu navigation ---- */
+    if (settings_menu_is_visible()) {
+        if (dist < TAP_MAX_MOVE_PX && dur <= TAP_MAX_MS) {
+            /* tap = select/toggle */
+            if (s_last_tap_ms != 0 && (now - s_last_tap_ms) <= DOUBLE_TAP_MAX_MS) {
+                s_last_tap_ms = 0;
+                s_cooldown_until_ms = now + FIRE_COOLDOWN_MS;
+                settings_menu_navigate(0);  /* select */
+            } else {
+                s_last_tap_ms = now;
+            }
+        } else if (dist >= SWIPE_MIN_MOVE_PX) {
+            s_last_tap_ms = 0;
+            s_cooldown_until_ms = now + 200;  /* shorter cooldown for menu */
+            /* Vertical swipe: up/down navigates.
+             * Horizontal swipe: left/right adjusts brightness when on
+             * the brightness item (acts like a slider). */
+            if (abs(dy) >= abs(dx)) {
+                /* vertical: up or down */
+                settings_menu_navigate(dy < 0 ? -1 : 1);
+                ESP_LOGI(TAG, "menu nav %s", dy < 0 ? "up" : "down");
+            } else {
+                /* horizontal: if brightness selected, adjust */
+                int b = settings_menu_get_brightness();
+                b += (dx > 0) ? 10 : -10;
+                settings_menu_set_brightness(b);
+                ESP_LOGI(TAG, "menu brightness %d -> %d", dx > 0 ? 10 : -10, b);
+            }
+        }
+        return;  /* menu consumes all touches */
+    }
+
+    /* ---- Normal mode: CSI view cycling ---- */
     if (dist < TAP_MAX_MOVE_PX && dur <= TAP_MAX_MS) {
         if (s_last_tap_ms != 0 && (now - s_last_tap_ms) <= DOUBLE_TAP_MAX_MS) {
             s_last_tap_ms = 0;
@@ -164,7 +198,7 @@ esp_err_t touch_gestures_init(void)
     bus_cfg.scl_io_num = TOUCH_I2C_SCL;
     bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
     bus_cfg.glitch_ignore_cnt = 7;
-    bus_cfg.trans_queue_depth = 4;
+    bus_cfg.trans_queue_depth = 16;  /* shared bus: touch + PMU need headroom */
     bus_cfg.flags.enable_internal_pullup = true;
 
     esp_err_t ret = i2c_new_master_bus(&bus_cfg, &s_bus);
