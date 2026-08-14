@@ -23,9 +23,6 @@
 #include "display_face.h"
 #include "sense_engine.h"
 #include "touch_gestures.h"
-#include "orb_pmu.h"
-#include "orb_ota.h"
-#include "settings_menu.h"
 
 static const char *TAG = "mosaic-ui";
 
@@ -51,34 +48,11 @@ void app_main(void)
     }
 
     /* Touch (CST9217): double-tap / swipe cycles the CSI display mode.
-     * Failure is non-fatal — the face keeps rendering. Must init BEFORE
-     * orb_pmu_init (PMU shares the touch controller's I2C bus). */
+     * Failure is non-fatal — the face keeps rendering. */
     ret = touch_gestures_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "touch_gestures_init failed: %s — auto-cycle only",
                  esp_err_to_name(ret));
-    }
-
-    /* AXP2101 PMU: power rails, PEK button events (long-press -> settings
-     * menu), battery/power readout. Shares the touch I2C bus. Non-fatal. */
-    ret = orb_pmu_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "orb_pmu_init failed: %s — no power button / battery",
-                 esp_err_to_name(ret));
-    }
-
-    /* Settings menu: brightness, WiFi status, power, CSI mode. Renders
-     * on the round display when toggled by long-press PEK. */
-    ret = settings_menu_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "settings_menu_init failed: %s", esp_err_to_name(ret));
-    }
-
-    /* OTA over HTTP: POST :8080/ota -> reboot. Makes the orb flashable
-     * without USB (mobile operation). Coexists with gateway (port 9000). */
-    ret = orb_ota_start();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "orb_ota_start failed: %s — no OTA", esp_err_to_name(ret));
     }
 
     /* The dome is the default live view: calm idle when the ether is

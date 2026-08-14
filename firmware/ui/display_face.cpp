@@ -39,8 +39,6 @@
 #include "display_face.h"
 #include "fx/fx_glow.h"
 #include "sense_engine.h"
-#include "settings_menu.h"
-#include "orb_pmu.h"
 
 static const char *TAG = "display_face";
 
@@ -569,14 +567,6 @@ public:
     }
 
     bool fbEnabled() const { return _fb_enabled; }
-
-    /* Brightness control — delegated to the CO5300 panel (same path as
-     * M5StopWatch-Flux). The 0x51 display brightness register controls
-     * the AMOLED backlight intensity. 0=off, 255=full. */
-    void setBrightness(uint8_t brightness)
-    {
-        _panel_instance.setBrightness(brightness);
-    }
 };
 
 static MosaicDisplay *s_display = nullptr;
@@ -732,49 +722,6 @@ esp_err_t display_face_set_csi_mode(int mode)
 csi_mode_t display_face_get_csi_mode(void)
 {
     return s_csiMode;
-}
-
-/* ------------------------------------------------------------------ */
-/* Brightness + display accessors (settings menu backbone)             */
-/* ------------------------------------------------------------------ */
-
-static volatile int s_brightness_pct = 50;  /* default 50% */
-
-void display_face_set_brightness(int pct)
-{
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    s_brightness_pct = pct;
-    if (s_display != nullptr) {
-        /* Map 0..100 -> 0..255 (M5GFX setBrightness range).
-         * 0 = display off, 255 = full brightness. */
-        uint8_t val = (uint8_t)(pct * 255 / 100);
-        s_display->setBrightness(val);
-    }
-    ESP_LOGI(TAG, "brightness -> %d%% (0x%02x)", pct, (int)(pct * 255 / 100));
-}
-
-int display_face_get_brightness(void)
-{
-    return s_brightness_pct;
-}
-
-void *display_face_get_display(void)
-{
-    return (void *)s_display;
-}
-
-void display_face_clear_frame(void)
-{
-    if (s_display != nullptr) {
-        s_display->fillScreen(0);  /* black */
-    }
-}
-
-void display_face_flush_frame(void)
-{
-    /* Reuse the same flush path as the glow canvas (vignette + display). */
-    mosaic_panel_flush(nullptr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1633,22 +1580,6 @@ static void face_task(void *arg)
         face_state_t state = s_state;
         bool suspended = s_suspended;
         if (s_mutex) xSemaphoreGive(s_mutex);
-
-        /* ---- PEK button: long-press toggles settings menu ---- */
-        orb_pek_event_t pek = orb_pmu_get_event();
-        if (pek == ORB_PEK_LONG_PRESS) {
-            bool vis = settings_menu_is_visible();
-            settings_menu_set_visible(!vis);
-            ESP_LOGI(TAG, "PEK long-press: settings menu %s",
-                     !vis ? "OPEN" : "CLOSED");
-        }
-
-        /* ---- Settings menu: separate render path when visible ---- */
-        if (settings_menu_is_visible()) {
-            settings_menu_render();
-            vTaskDelay(pdMS_TO_TICKS(100));  /* menu at ~10fps — fine */
-            continue;  /* skip dome/CSI rendering while menu is open */
-        }
 
         /* CSI mode: pinned, or auto-cycling every ~30s (merged ->
          * standalone -> plain dome -> ...). */

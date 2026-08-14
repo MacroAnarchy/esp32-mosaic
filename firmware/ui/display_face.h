@@ -71,26 +71,6 @@ esp_err_t display_face_set_csi_mode(int mode);
 
 csi_mode_t display_face_get_csi_mode(void);
 
-/* ---- Settings menu integration (orb-settings backbone) ---- */
-
-/* Set display brightness 0..100. Maps to M5GFX setBrightness internally.
- * Thread-safe. The settings menu calls this. */
-void display_face_set_brightness(int pct);
-int  display_face_get_brightness(void);
-
-/* Get the raw M5GFX display handle for direct drawing (fillRect,
- * drawString, etc. — used by the settings menu). Returns void* =
- * M5GFX*. NULL if display init failed. The caller must hold the
- * face mutex (via display_face_render_menu_frame) before drawing. */
-void *display_face_get_display(void);
-
-/* Full framebuffer clear + flush — used by the settings menu to render
- * a clean frame (the glow canvas's beginFrame/push path doesn't handle
- * direct M5GFX draws). Clears the whole framebuffer to black, then the
- * caller draws via the display handle, then calls this again to flush. */
-void display_face_clear_frame(void);
-void display_face_flush_frame(void);
-
 #ifdef __cplusplus
 }
 #endif
