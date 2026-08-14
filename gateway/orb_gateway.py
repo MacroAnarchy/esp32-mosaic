@@ -16,6 +16,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -91,6 +92,39 @@ def log(level, msg):
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {level:<5} {msg}", flush=True)
+
+
+class TimestampedLogHandler(logging.Handler):
+    """Route Python logging (aiohttp internals) through our log() helper.
+
+    Without this, aiohttp's default web_protocol error printer dumps raw
+    multi-line tracebacks — e.g. ``ClientConnectionResetError: Cannot
+    write to closing transport`` from a node whose WS dropped mid-response.
+    Those blocks lack the ``[timestamp] LEVEL`` prefix every INFO/WARN
+    line carries, so they can't be correlated with the requests that
+    caused them. This handler gives every log record the same format.
+    """
+
+    _LEVEL_MAP = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRIT",
+    }
+
+    def emit(self, record):
+        level = self._LEVEL_MAP.get(record.levelno, "INFO")
+        msg = record.getMessage()
+        # Preserve the first traceback line as context (the exception
+        # type) but drop the multi-line stack — it's noise in a gateway
+        # log that runs for days. A repeat error is visible as repeated
+        # WARN/ERROR lines, which is the actionable signal.
+        if record.exc_info and record.exc_info[0] is not None:
+            exc_type = record.exc_info[0].__name__
+            exc_msg = record.exc_info[1]
+            msg = f"{msg}: {exc_type}: {exc_msg}"
+        log(level, f"[aiohttp] {msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +501,13 @@ class Gateway:
                         await ws.send_str(json.dumps({"error": "bad_json"}))
                         continue
                     status, body = self.ingest(envelope, request.remote)
-                    await ws.send_str(json.dumps(body))
+                    try:
+                        await ws.send_str(json.dumps(body))
+                    except Exception as e:
+                        # Benign: client closed the WS mid-response (e.g.
+                        # orb WiFi blip). Log one clean WARN line instead
+                        # of letting aiohttp print a raw traceback.
+                        log("WARN", f"[ws] send to {request.remote or '?'} failed: {type(e).__name__}: {e}")
                 elif msg.type == WSMsgType.ERROR:
                     break
         finally:
@@ -484,6 +524,22 @@ def main():
     server, world_model, token = load_config()
     if args.port:
         server["port"] = args.port
+
+    # Install our timestamped handler on the loggers aiohttp uses
+    # internally (server + web). Without this, aiohttp's own error
+    # printer emits raw tracebacks without timestamps — benign WS drops
+    # produced multi-line blocks that couldn't be correlated with the
+    # requests that caused them.
+    #
+    # The access logger is disabled: our ingest() already logs every
+    # POST with node/type/status, so the access log is pure duplication
+    # (and ~2 lines per scan in a gateway that runs for days).
+    for logger_name in ("aiohttp.server", "aiohttp.web"):
+        lg = logging.getLogger(logger_name)
+        lg.handlers = [TimestampedLogHandler()]
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
     gw = Gateway(server)
     gw.world_model = world_model
