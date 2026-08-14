@@ -69,6 +69,15 @@
 // WiFi offline scan cycle (see docs/spec-wifi-scan.md): drop WiFi ->
 // promiscuous -> hop ch 1..13 -> capture beacons/probes -> reconnect ->
 // report as one type:"wifi" batch envelope.
+//
+// WEDGE CONTEXT (2026-08-14, device-keeper deleg_93dc36bb): the
+// WIFI_MODE_NULL -> WIFI_MODE_STA transition corrupts the lwIP TX path —
+// every HTTP POST fails with ESP_ERR_HTTP_CONNECT after the first scan
+// cycle (~57s post-boot), wedging the orb permanently (zombie-STA wedge,
+// root-caused live). orb-csi-test (known working) never enters
+// WIFI_MODE_NULL. The scan is valuable (beacon/probe layer) — so instead
+// of disabling it, the scan must sniff WITHIN STA mode on the associated
+// channel (no WIFI_MODE_NULL transition). See runWifiScanCycle().
 #ifndef MOSAIC_WIFI_SCAN_ENABLE
 #define MOSAIC_WIFI_SCAN_ENABLE 1
 #endif
@@ -541,56 +550,38 @@ static bool wifiJoinBlocking(int timeoutMs, int retries) {
 
 // One offline scan cycle. Assumes caller holds no other radio activity.
 static void runWifiScanCycle() {
-  ESP_LOGI(TAG, "--- WiFi offline scan (%ds interval) ---",
+  ESP_LOGI(TAG, "--- WiFi scan (%ds interval, in-STA) ---",
            MOSAIC_WIFI_SCAN_INTERVAL_SECONDS);
 
   g_wifiFrameCount = 0;
   g_wifiScanActive = true;
 
-#if MOSAIC_CSI_ENABLE
-  // CSI rides the STA association — the radio is about to leave STA mode
-  // for the offline sweep, so pause CSI (stop FSM + router ping). It is
-  // resumed below after the reconnect.
-  csi_sensing_pause();
-#endif  // MOSAIC_CSI_ENABLE
-
-  // 1) Drop association, go NULL, enter promiscuous
-  esp_wifi_disconnect();
-  xEventGroupClearBits(s_wifiEvents, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
-  esp_wifi_set_mode(WIFI_MODE_NULL);
+  // In-STA scan: stay associated on the AP channel and sniff passively.
+  // NEVER drop to WIFI_MODE_NULL — the NULL->STA transition corrupts the
+  // lwIP TX path (zombie-STA wedge, root-caused 2026-08-14: every HTTP
+  // POST fails ESP_ERR_HTTP_CONNECT after the first scan cycle). The
+  // associated channel carries the router + all neighbors on it; that's
+  // the bulk of the beacon/probe layer value.
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(wifiPromiscuousCallback);
+  wifi_promiscuous_filter_t filt = {.filter_mask = WIFI_PROMIS_FILTER_MASK_ALL};
+  esp_wifi_set_promiscuous_filter(&filt);
 
-  // 2) Hop channels 1..13, holding each ~80ms (~1s total)
-  for (uint8_t ch = 1; ch <= WIFI_SCAN_MAX_CHANNEL; ch++) {
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    vTaskDelay(pdMS_TO_TICKS(MOSAIC_WIFI_SCAN_CHANNEL_HOLD_MS));
-  }
+  // Hold on the current (associated) channel long enough to catch a
+  // beacon interval (~102ms) plus probe requests. ~1.2s window.
+  vTaskDelay(pdMS_TO_TICKS(1200));
 
-  // 3) Exit promiscuous, back to STA
+  // Exit promiscuous — association + lwIP TX path untouched.
   esp_wifi_set_promiscuous(false);
   g_wifiScanActive = false;
-  esp_wifi_set_mode(WIFI_MODE_STA);
 
-  // 4) Reconnect with retry loop — a node that can't rejoin is dead.
-  //    If join fails we KEEP retrying (outer loop also retries) while the
-  //    rest of the sensing cycle (BLE) keeps collecting.
-  bool joined = wifiJoinBlocking(MOSAIC_WIFI_RECONNECT_TIMEOUT_MS,
-                                 MOSAIC_WIFI_RECONNECT_RETRIES);
-  if (joined) {
-    char bssid[MAC_STR_LEN] = "";
-    sense_wifi_get_ap_bssid(bssid, sizeof(bssid));
-    ESP_LOGI(TAG, "  reconnected. BSSID: %s", bssid);
+  // No disconnect, no reconnect, no CSI pause — the STA link never moved.
 #if MOSAIC_CSI_ENABLE
-    // Back on the AP channel — CSI resumes and relearns its baseline.
-    csi_sensing_resume();
-#endif  // MOSAIC_CSI_ENABLE
-  } else {
-    ESP_LOGW(TAG, "  reconnect FAILED — will keep retrying on next cycle");
-  }
+  csi_sensing_resume();  // no-op safety: CSI stayed running throughout
+#endif
 
-  // 5) Report the batch envelope (only if back online and frames captured)
-  if (joined && g_wifiFrameCount > 0) {
+  // 5) Report the batch envelope (if frames captured — still associated)
+  if (g_wifiFrameCount > 0) {
     std::string payload = "{\"v\":1,\"node\":\"" + std::string(MOSAIC_NODE_NAME) +
                           "\",\"type\":\"wifi\",\"ts\":" +
                           std::to_string(sense::uptime_ms()) +
