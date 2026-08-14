@@ -398,7 +398,12 @@ class Gateway:
         """Validate, log, store, broadcast. Returns (http_status, body)."""
         rec, err = self.stamp(envelope, source_ip)
         if err:
-            log("WARN", f"ingest {source_ip or '?'} rejected: {err}")
+            # Include whatever type/node the envelope claimed (if any) so the
+            # rejection is diagnosable — was it a scan with a bad wrapper, or
+            # a completely malformed blob claiming to be csi?
+            claimed_type = envelope.get("type", "?") if isinstance(envelope, dict) else "?"
+            claimed_node = envelope.get("node", "?") if isinstance(envelope, dict) else "?"
+            log("WARN", f"ingest {source_ip or '?'} rejected: {err} type={claimed_type} node={claimed_node}")
             return 400, {"error": err}
         # Canonical JSONL log (source of truth)
         with open(self.log_file, "a") as f:
@@ -421,10 +426,16 @@ class Gateway:
     # -- HTTP handlers ------------------------------------------------------
 
     async def handle_ingest(self, request):
+        # Read raw body FIRST so a JSON parse failure is diagnosable.
+        # Before this, a bad_json rejection logged only the source IP — no
+        # type, no payload excerpt, no parse error — making it impossible to
+        # tell what a node sent wrong (orb-01 was dropping ~2/hour blind).
+        raw = await request.read()
         try:
-            envelope = await request.json()
-        except Exception:
-            log("WARN", f"ingest {request.remote or '?'} bad_json -> 400")
+            envelope = json.loads(raw)
+        except Exception as e:
+            excerpt = raw[:120].decode("utf-8", errors="replace")
+            log("WARN", f"ingest {request.remote or '?'} bad_json -> 400: {type(e).__name__}: {e} body_len={len(raw)} body[:120]={excerpt!r}")
             return web.json_response({"error": "bad_json"}, status=400)
         status, body = self.ingest(envelope, request.remote)
         return web.json_response(body, status=status)
