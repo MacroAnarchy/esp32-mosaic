@@ -203,10 +203,15 @@ DEFAULT_WM = {
     # event-driven: a still room produces no events for hours, so only a
     # 12h+ silence means the channel itself is gone (today no node sends
     # type:'csi' — the body channel is dead, now VISIBLE).
+    # Streaming era (CSI is now a ~40s continuous feature-snapshot stream,
+    # not event-driven): the channel is fed every ~40s, so a 12h tolerance
+    # would hide a dead CSI pipeline for hours. 300s ≈ ~7 missed beats —
+    # enough headroom for a slow/queued node, yet STALE within minutes of a
+    # real death (STALE at 5 min, OFFLINE at ~10 min per the 2× rule).
     "channel_scan_max_age_seconds": 600,
     "channel_wifi_max_age_seconds": 900,
     "channel_probes_max_age_seconds": 3600,
-    "channel_csi_max_age_seconds": 43200,
+    "channel_csi_max_age_seconds": 300,
     # Node registry hygiene: one-off test registrations (sub-minute lives,
     # loopback IPs) would show 'GONE' in --status forever. Two layers of
     # defense: (1) AUTO-DETECT by phantom signature (loopback IP or

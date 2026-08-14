@@ -134,14 +134,15 @@ world_model:
   # age before a channel reads STALE (2x = QUIET/OFFLINE). scan/wifi are periodic
   # streams; probes are opportunistic (modern phones mostly passive-scan —
   # sparse is NORMAL): while a node still reports, a quiet probes channel
-  # reads QUIET, not OFFLINE (silence ≠ broken); csi is event-driven, so a
-  # still room stays quiet for hours and only a 12h+ silence means the
-  # channel itself is gone. A dead sensor is reported explicitly instead of
-  # silently absent.
+  # reads QUIET, not OFFLINE (silence ≠ broken). CSI is now a ~40s
+  # continuous feature-snapshot stream, so a short tolerance catches a dead
+  # pipeline quickly: 300s ≈ ~7 missed beats — headroom for a slow/queued
+  # node, yet STALE within minutes of a real death. A dead sensor is
+  # reported explicitly instead of silently absent.
   channel_scan_max_age_seconds: 600     # BLE scans every ~20s → 10 min dead
   channel_wifi_max_age_seconds: 900     # beacon snapshots every few min
   channel_probes_max_age_seconds: 3600  # probe requests (opportunistic)
-  channel_csi_max_age_seconds: 43200    # body/motion events (12h quiet OK)
+  channel_csi_max_age_seconds: 300      # ~40s feature-snapshot stream (5 min dead)
 
   # Node registry hygiene: one-off test registrations (sub-minute lives,
   # loopback IPs) would show 'GONE' in --status forever. The brain
