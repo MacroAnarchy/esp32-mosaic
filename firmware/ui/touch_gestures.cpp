@@ -47,6 +47,10 @@ static i2c_master_bus_handle_t s_bus = NULL;
 static esp_lcd_panel_io_handle_t s_tp_io = NULL;
 static esp_lcd_touch_handle_t s_tp = NULL;
 
+/* Shared I2C bus lock — touch + PMU serialize their bus access through this.
+ * Created in touch_gestures_init, consumed by orb_pmu_init. */
+static SemaphoreHandle_t s_i2c_lock = NULL;
+
 /* Gesture tracking. */
 static gesture_state_t s_gest = GEST_IDLE;
 static uint32_t s_press_ts_ms = 0;
@@ -189,6 +193,13 @@ esp_err_t touch_gestures_init(void)
         return ESP_OK; /* already initialized */
     }
 
+    /* Create the shared I2C bus lock before anything touches the bus. */
+    s_i2c_lock = xSemaphoreCreateMutex();
+    if (s_i2c_lock == NULL) {
+        ESP_LOGE(TAG, "failed to create I2C bus lock");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Own the main I2C bus (SDA=15, SCL=14) — nothing else in this
      * firmware claims I2C_NUM_0 (the AXP2101 PMU module is not
      * compiled into the ui env). Same config as orb_pmu/orb-csi-test. */
@@ -206,6 +217,18 @@ esp_err_t touch_gestures_init(void)
         ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    /* Probe the I2C bus for the CST9217 at 0x5A. */
+    esp_err_t probe = i2c_master_probe(s_bus, ESP_LCD_TOUCH_IO_I2C_CST9217_ADDRESS, 100);
+    ESP_LOGI(TAG, "I2C probe 0x%02X (CST9217): %s",
+             ESP_LCD_TOUCH_IO_I2C_CST9217_ADDRESS,
+             probe == ESP_OK ? "ACK — chip present" : "NO-ACK — chip missing");
+
+    /* No manual GPIO2 reset: the orb-csi-test firmware (known working) sets
+     * rst_gpio_num=NC and does NOT drive GPIO2 at all. GPIO2 on this board
+     * is NOT the CST9217's reset line — driving it LOW likely interferes
+     * with the AMOLED panel or another component. The CST9217 initializes
+     * itself on power-up and does not need a software-driven reset. */
 
     /* Touch controller panel IO on the shared bus (CST9217 @ 0x5A). */
     esp_lcd_panel_io_i2c_config_t tp_io_cfg = {};
@@ -225,10 +248,11 @@ esp_err_t touch_gestures_init(void)
     esp_lcd_touch_config_t tp_cfg = {};
     tp_cfg.x_max = TOUCH_RES_X;
     tp_cfg.y_max = TOUCH_RES_Y;
-    /* Drive TP_RESET (GPIO2) — the driver toggles it during init and
-     * on read errors. Keeps the chip out of the floating-reset state
-     * that clamped the bus during bring-up. INT is unused (polling). */
-    tp_cfg.rst_gpio_num = TOUCH_RST_GPIO;
+    /* Touch reset = NC: GPIO2 is shared with the AMOLED panel (orb-csi-test
+     * reference: "RST is shared with the AMOLED panel (GPIO2) — leave it
+     * alone"). The CST9217 self-initializes on power-up; driving GPIO2 LOW
+     * interferes with the panel. INT is unused (polling). */
+    tp_cfg.rst_gpio_num = GPIO_NUM_NC;   /* shared with AMOLED panel — leave it alone */
     tp_cfg.int_gpio_num = GPIO_NUM_NC;
     tp_cfg.levels.reset = 0;
     tp_cfg.levels.interrupt = 0;
@@ -256,4 +280,21 @@ esp_err_t touch_gestures_init(void)
 i2c_master_bus_handle_t touch_gestures_get_bus(void)
 {
     return s_bus;
+}
+
+/* Acquire/release the shared I2C bus lock. The touch poll task wraps each
+ * data read cycle; the PMU poll task wraps each register batch. Timeout
+ * ensures a dead lock holder can't starve the poll task indefinitely. */
+void touch_i2c_lock(void)
+{
+    if (s_i2c_lock) {
+        xSemaphoreTake(s_i2c_lock, pdMS_TO_TICKS(100));
+    }
+}
+
+void touch_i2c_unlock(void)
+{
+    if (s_i2c_lock) {
+        xSemaphoreGive(s_i2c_lock);
+    }
 }

@@ -166,14 +166,21 @@ static void pmu_poll_task(void *arg)
 
     /* First-cycle init: enable PEK IRQs + ADC channels. Done here (not
      * in orb_pmu_init) to avoid blocking app_main on I2C writes that
-     * contend with the 60Hz touch poll task on the shared bus. */
+     * contend with the 60Hz touch poll task on the shared bus. Wrapped
+     * in the bus lock to serialize with touch reads. */
+    touch_i2c_lock();
     axp_write_reg(AXP2101_REG_ADC_CHANNEL_CTRL, 0x1D);  /* ADC: batt+vbus+sys+temp */
     axp_write_reg(AXP2101_REG_INTEN2,
                   (uint8_t)((AXP2101_IRQ_PKEY_LONG >> 8) | (AXP2101_IRQ_PKEY_SHORT >> 8)));
     axp_clear_irq();
+    touch_i2c_unlock();
     ESP_LOGI(TAG, "poll task: PEK IRQs + ADC enabled");
 
     while (1) {
+        /* Serialize all PMU I2C reads in one locked batch to avoid
+         * corrupting the touch poll task's reads on the shared bus. */
+        touch_i2c_lock();
+
         /* Read the IRQ status registers (INTSTS1/2/3). */
         uint8_t sts1 = 0, sts2 = 0;
         axp_read_reg(AXP2101_REG_INTSTS1, &sts1);
@@ -240,6 +247,8 @@ static void pmu_poll_task(void *arg)
         s_power_info.system_mv = sys_mv;
         s_power_info.temp_c = temp_c;
         portEXIT_CRITICAL(&s_power_lock);
+
+        touch_i2c_unlock();  /* release the shared bus */
 
         vTaskDelay(pdMS_TO_TICKS(PMU_POLL_MS));
     }

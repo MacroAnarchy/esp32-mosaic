@@ -49,8 +49,14 @@ extern "C" {
 esp_err_t touch_gestures_init(void);
 
 /* The shared I2C master bus handle (NULL until touch_gestures_init).
- * Exposed so a future PMU/IMU module can add devices to the same bus. */
+ * Exposed so the PMU module can add devices to the same bus. */
 i2c_master_bus_handle_t touch_gestures_get_bus(void);
+
+/* Shared I2C bus mutex — touch and PMU MUST wrap their I2C transactions
+ * with these to prevent concurrent-access corruption on the shared bus.
+ * touch_gestures_init creates the mutex; orb_pmu_init calls these. */
+void touch_i2c_lock(void);
+void touch_i2c_unlock(void);
 
 #ifdef __cplusplus
 }

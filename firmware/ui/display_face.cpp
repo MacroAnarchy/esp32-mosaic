@@ -1634,13 +1634,22 @@ static void face_task(void *arg)
         bool suspended = s_suspended;
         if (s_mutex) xSemaphoreGive(s_mutex);
 
-        /* ---- PEK button: long-press toggles settings menu ---- */
+        /* ---- PEK button: long-press toggles settings menu,
+         *      short-press cycles CSI display mode (backup for touch) ---- */
         orb_pek_event_t pek = orb_pmu_get_event();
         if (pek == ORB_PEK_LONG_PRESS) {
             bool vis = settings_menu_is_visible();
             settings_menu_set_visible(!vis);
             ESP_LOGI(TAG, "PEK long-press: settings menu %s",
                      !vis ? "OPEN" : "CLOSED");
+        } else if (pek == ORB_PEK_SHORT_PRESS) {
+            /* Short-press PEK = cycle CSI mode (merged -> standalone -> dome).
+             * Backup path for when touch is unresponsive or the owner prefers
+             * the button. Works in any view (dome / merged / standalone). */
+            csi_mode_t cur = s_csiMode;
+            int next = ((int)cur + 1) % CSI_MODE_COUNT;
+            display_face_set_csi_mode(next);
+            ESP_LOGI(TAG, "PEK short-press: csi mode %d -> %d", (int)cur, next);
         }
 
         /* ---- Settings menu: separate render path when visible ---- */
