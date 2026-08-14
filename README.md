@@ -3,9 +3,10 @@
 **Your ESP32 already has the radios. Here's how to make it aware.**
 
 ESP32-Mosaic turns any ESP32 board into a passive radio observer — it senses the
-devices around it (BLE), the WiFi landscape (beacons + probes), and builds a
-persistent picture of its environment. Fragments of radio evidence become a
-coherent world model: who's here, what's nearby, what stays and what moves.
+devices around it (BLE), the WiFi landscape (beacons + probes), and — on S3-class
+radios — the physical layer itself (CSI: how RF energy reflects off a body
+moving through the room). Fragments of radio evidence become a coherent world
+model: who's here, what's nearby, what stays and what moves.
 
 Different boards working together form a **mosaic** — each one a tile, together
 a picture of your world.
@@ -25,25 +26,21 @@ you want to use it for.
 
 ## Use cases
 
+The stack is a general passive-sensing capability. Concrete products built on
+it live in [`examples/`](examples/) — see below.
+
+- **Home security / intruder detection** — the radar knows the RF baseline of
+  your home. An unknown device appearing at -30 dBm at 3 am, or a CSI field
+  deviation in an empty room, is an event your home can report itself. No
+  cameras, no microphones, no cloud.
 - **Presence-gated AI** — your assistant only listens to you, because it knows
   who you are by radio (entity cluster + proximity + body verification).
-- **Home security** — the radar knows the RF baseline of your home. An unknown
-  device appearing at -30 dBm at 3am, or a CSI field deviation in an empty room,
-  is an event your home can report itself. No cameras, no microphones, no cloud.
 - **Surveillance / tracking** — watch what enters and leaves a space, learn
   habitual paths (bedroom → kitchen → door every morning), know when a person
   returns by their device constellation. The remembering radar — it sees what
   other scanners forget.
 - **Smart-home automation** — "you're home" triggers scenes from RF presence,
   not phone GPS or app state. The room knows when you're actually in it.
-- **Pet wellness station** *(flagship example app)* — a stationary orb watches
-  your cat or dog through radio alone: no collar, no camera, no wearables.
-  It learns the pet's personal behavior baseline (nap spots + hours, activity
-  rhythm, food-bowl circuits) and flags deviations — stress signals after the
-  owner leaves (pacing spike), drift over long absences, reunion reactions, and
-  early signs of illness (hiding, reduced movement) days before visible
-  symptoms. Explainable pattern math, not black-box AI. See
-  [pet-wellness-station spec](#pet-wellness-station---example-application-spec).
 
 ## What's inside
 
@@ -51,14 +48,38 @@ you want to use it for.
 esp32-mosaic/
 ├── firmware/        Sense engine (PlatformIO/Arduino)
 │   ├── src/main.cpp BLE + WiFi passive scanning → HTTP POST to gateway
+│   ├── components/  Per-sensor modules (sense/, CSI on S3, ARP feed)
 │   └── linux_node.py  Same protocol from any Linux/Android box (monitor mode)
 ├── gateway/         Python brain (aiohttp)
 │   ├── orb_gateway.py    HTTP + WebSocket ingest, JSONL + SQLite
 │   ├── mosaic_brain.py   world model: entities, chains, places, movement
 │   └── mosaic_mcp.py     MCP server — give your AI physical senses
+├── examples/        Products built on the stack (see below)
 └── docs/
     └── protocol.md  The envelope protocol (v1)
 ```
+
+## Sensing layers
+
+Mosaic combines three passive radio senses. Each is optional; they compose.
+
+- **BLE** — device discovery + classification. Watches for MACs/RSSI on every
+  node; the foundation of the entity model (who's here).
+- **WiFi** — beacon + probe capture. Maps the RF landscape: the AP you're
+  associated to, neighbors, SSIDs and their channels.
+- **CSI (Channel State Information)** — the physical layer. On capable S3-class
+  radios, Mosaic reads *how* RF energy reflects off a body moving through the
+  room: presence, motion intensity, and breathing/vitals, computed from the
+  channel's sub-carrier state. This is what takes Mosaic from "device list" to
+  "there is a 4 kg body in this room, it moved, it's breathing." It is a
+  significant part of the stack going forward — the difference between knowing
+  *what's near* and knowing *who is actually here*.
+
+| Layer  | Tells you                      | Chip        |
+|--------|--------------------------------|-------------|
+| BLE    | what devices are present       | any ESP32   |
+| WiFi   | the RF landscape / neighbors   | any ESP32   |
+| CSI    | a body is here, moving, alive  | S3 (ESP32-S3) |
 
 ## Architecture
 
@@ -211,51 +232,28 @@ python3 mosaic_mcp.py    # or wire into your MCP client
 - **v0.2** — BLE presence + device classification (findmy/meta/flipper),
   WiFi beacon/probe capture (offline scan cycle), world-model brain
   (entities, chains, places), MCP server
-- **Next:** CSI sensing (body presence/vitals on S3), network-layer identity
-  feed (ARP), entity persistence across runs, multi-node swarm
+- **CSI (S3)** — presence + motion (Phase 1) and breathing band + pattern-layer
+  seed (Phase 2) are live on the orb. Wander calibration in progress. CSI is a
+  first-class sensing layer of the stack, not an add-on.
+- **Next:** CSI wander calibration completion, network-layer identity feed
+  (ARP), entity persistence across runs, multi-node swarm
 
-## Pet wellness station — example application spec
+## Examples — products built on the stack
 
-A concrete product built on the mosaic stack. Everything below is buildable
-with the current firmware + gateway + anomaly-engine design.
+The stack is a general capability; these are concrete products built on it.
+Each example composes the same sensing layers in a different way. The last one
+is the natural peak — it combines them all.
 
-**The product:** a stationary radio puck with a round screen + phone app. Plug
-it in, pair it, leave it. It watches the pet's life through radio alone and
-tells the owner: *normal / stressed / something's off* — based on the pet's
-own learned baseline. No collar, no camera, no wearables.
+| Example | What it does | Sensing used |
+|---------|--------------|--------------|
+| [Home security / intruder detection](examples/home-security.md) | RF baseline of your home; unknown device or CSI field deviation = event | BLE + CSI + ARP |
+| [Pet wellness station](examples/pet-wellness-station.md) | Watches your cat/dog through radio alone: baseline, deviations, early illness signs | BLE + CSI + pattern layer + anomaly engine |
 
-**Why this works technically:**
-- CSI + BLE presence detect a pet-sized body (4+ kg) moving through the room —
-  presence, movement intensity, location-over-time are all measurable
-- The pattern layer (per-hour-of-day activity, 7-day decay) learns the pet's
-  personal rhythm: nap spots + hours, activity windows, food-bowl circuits
-- The anomaly engine flags deviations from that baseline
-
-**What it measures (all from existing data):**
-| Signal | Meaning |
-|--------|---------|
-| Departure spike | movement burst right after owner leaves (pacing = separation response) |
-| Absence drift | activity/appetite rhythm shifts over days 1-3 of an absence |
-| Reunion reaction | movement burst correlated with owner's device re-entering range |
-| Rhythm changes | nap spots, activity windows, night behavior vs baseline |
-| Lethargy trend | reduced movement amplitude over days — early illness signal |
-
-**Key properties:**
-- **No AI magic** — explainable pattern math on real radio data
-- **No wearables** — the pet wears nothing
-- **No camera** — privacy-positive; radio presence, no footage
-- **Simple hardware** — stationary: no battery, no case engineering, no mobile
-  ergonomics. One ESP32-class board + round AMOLED + gateway
-- **Market position** — adjacent to Furbo/Petcube camera feeders but delivers
-  health/behavior insight they can't, at lower BOM (no camera, no video cloud)
-
-**Build roadmap (squad):**
-1. ✅ CSI presence + motion (Phase 1)
-2. ✅ Breathing band + pattern-layer seed (Phase 2)
-3. 🔄 Wander calibration (quiet-window + adaptive threshold)
-4. ⬜ Pet baseline profiles (per-pet, place-memories per BSSID)
-5. ⬜ Anomaly flags: departure spike / absence drift / reunion reaction
-6. ⬜ Phone app: stats, daily report, "what changed" view
+**Pet wellness station is the flagship** — not because it's the only use case,
+but because it *composes the whole stack*: presence (who's home), movement
+(what's moving), CSI (a body's reflections), and the anomaly engine (when the
+pattern breaks). It demonstrates that the technical pieces build into a real
+product. Full specs live in [`examples/`](examples/).
 
 ## Built with / Inspired by
 
