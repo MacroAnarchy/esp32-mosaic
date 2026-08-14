@@ -713,7 +713,16 @@ static void senseTask(void *arg) {
     // (lossy by design).
     csi_sensing_drain_and_report();
 #endif  // MOSAIC_CSI_ENABLE
-    // Scan for 5 seconds (callbacks fill g_records meanwhile)
+    // Scan for 5 seconds (callbacks fill g_records meanwhile). CSI must be
+    // PAUSED first: the BLE scan uses the same radio and if it starts while
+    // the ping RX path is establishing, the CSI ping dies permanently
+    // (zombie-STA wedge, root-caused 2026-08-14: ping timeout at seq=15
+    // within 100ms of BLE scan start, radar samples raw=0 forever after).
+    // The loop serializes BLE + WiFi scans but the CSI FSM runs async — so
+    // serialize it here explicitly.
+#if MOSAIC_CSI_ENABLE
+    csi_sensing_pause();
+#endif  // MOSAIC_CSI_ENABLE
     ESP_LOGI(TAG, "--- BLE scan (5s) ---");
     portENTER_CRITICAL(&s_records_lock);
     g_recordCount = 0;
@@ -743,6 +752,12 @@ static void senseTask(void *arg) {
 
     // Report to gateway — Mosaic protocol v1 envelope with real BSSID
     if (count > 0 && sense_wifi_is_connected()) postScanEnvelope(count);
+
+    // BLE scan done — CSI resumes (no-op if it never started / already up).
+    // The radio is back in WiFi-only mode, ping RX can establish cleanly.
+#if MOSAIC_CSI_ENABLE
+    csi_sensing_resume();
+#endif  // MOSAIC_CSI_ENABLE
 
 #if MOSAIC_WIFI_SCAN_ENABLE
     // WiFi offline scan cycle — sequential with BLE (one radio, phases
