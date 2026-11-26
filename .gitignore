@@ -18,3 +18,4 @@ firmware/managed_components/
 *.db
 *.jsonl
 .orb/
+.pytest_cache/

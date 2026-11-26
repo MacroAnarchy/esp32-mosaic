@@ -23,6 +23,7 @@ Hermes config (~/.hermes/config.yaml):
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -49,15 +50,59 @@ def robust_spread(vals):
         return max(vals) - min(vals)
     s = sorted(vals)
     n = len(s)
-    lo = s[max(0, int(n * 0.10) - 1)]
-    hi = s[min(n - 1, int(n * 0.90) - 1)]
+    # Nearest-rank percentiles: index ceil(p*n)-1. int() (floor) put p10 on
+    # the very minimum for 10-19 samples, so a single deep fade was NOT
+    # trimmed — the exact case this function exists for. Identical to the
+    # old indices whenever n is a multiple of 10.
+    lo = s[max(0, math.ceil(n * 0.10) - 1)]
+    hi = s[min(n - 1, math.ceil(n * 0.90) - 1)]
     return hi - lo
 
 
-def conn():
-    c = sqlite3.connect(DB)
+QUERY_MAX_ROWS = 500
+
+
+def conn(db=None):
+    """Open the world-model DB READ-ONLY.
+
+    Every MCP tool only reads. Opening with SQLite's mode=ro plus
+    PRAGMA query_only makes that a guarantee enforced by SQLite itself,
+    not by string-matching the SQL: a prefix check alone lets
+    "WITH x AS (SELECT 1) DELETE FROM sightings" through, and an agent
+    (or a prompt-injected one) could wipe the database.
+    """
+    path = os.path.abspath(db or DB)
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    c.execute("PRAGMA query_only = ON")
     c.row_factory = sqlite3.Row
     return c
+
+
+def run_readonly_query(sql, limit=50, db=None):
+    """Execute an ad-hoc SELECT against the DB; returns a JSON string.
+
+    Defense in depth: the cheap prefix check gives a friendly error for the
+    obvious case, the read-only connection is what actually guarantees that
+    nothing can be modified.
+    """
+    if not sql.strip().lower().startswith(("select", "with")):
+        return json.dumps({"error": "read-only: only SELECT/WITH allowed"})
+    try:
+        limit = max(1, min(int(limit), QUERY_MAX_ROWS))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        c = conn(db)
+    except sqlite3.Error as e:
+        return json.dumps({"error": f"database unavailable: {e}"})
+    try:
+        cur = c.execute(sql)
+        rows = cur.fetchmany(limit)
+        return json.dumps(_rows_to_dicts(rows), indent=1)
+    except sqlite3.Error as e:
+        return json.dumps({"error": str(e)})
+    finally:
+        c.close()
 
 
 def _rows_to_dicts(rows):
@@ -183,15 +228,7 @@ def tools():
     @mcp.tool()
     def query(sql: str, limit: int = 50) -> str:
         """Run a read-only SQL query against the mosaic sightings database."""
-        if not sql.strip().lower().startswith(("select", "with")):
-            return json.dumps({"error": "read-only: only SELECT/WITH allowed"})
-        c = conn()
-        try:
-            cur = c.execute(sql)
-            rows = cur.fetchmany(limit)
-            return json.dumps(_rows_to_dicts(rows), indent=1)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        return run_readonly_query(sql, limit)
 
     @mcp.tool()
     def csi_status(hours: int = 24) -> str:

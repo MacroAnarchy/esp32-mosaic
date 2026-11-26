@@ -227,6 +227,14 @@ pip install mcp
 python3 mosaic_mcp.py    # or wire into your MCP client
 ```
 
+### Tests (gateway)
+
+```bash
+cd gateway
+pip install -r requirements-dev.txt
+python3 -m pytest -q tests
+```
+
 ## Status
 
 - **v0.2** — BLE presence + device classification (findmy/meta/flipper),
