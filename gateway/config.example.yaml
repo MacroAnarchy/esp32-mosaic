@@ -18,7 +18,9 @@ log_file: presence.jsonl
 db_file: orb.db
 
 # Optional: shared auth token for ingest. Leave empty for no auth.
-# If set, nodes must send header "X-Mosaic-Token: <token>".
+# If set, nodes must send header "X-Mosaic-Token: <token>" (HTTP POST and
+# WebSocket); WebSocket clients that cannot set headers may use /ws?token=<token>.
+# Requests without a valid token get 401.
 ingest_token: ""
 
 # --- World model tuning (static for now — tuned the hard way) ---

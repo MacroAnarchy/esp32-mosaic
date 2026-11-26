@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -448,18 +449,57 @@ class Gateway:
         except Exception as e:
             log("ERROR", f"db write failed: {e}")
         # Broadcast to live subscribers
-        for ws in list(self.subscribers):
-            try:
-                ws.send_str(json.dumps(rec))
-            except Exception as e:
-                log("WARN", f"ws broadcast failed, dropping subscriber: {e}")
-                self.subscribers.discard(ws)
+        self.broadcast(rec)
         log("INFO", f"ingest {source_ip or '?'} node={(rec or {}).get('node', '?')} type={(rec or {}).get('type', '?')} -> 200")
         return 200, {"ok": True}
+
+    def broadcast(self, rec):
+        """Fan a stored record out to every live WebSocket subscriber.
+
+        ws.send_str() is a coroutine: calling it from this synchronous path
+        without scheduling it created a coroutine object that was never
+        awaited, so live subscribers silently received nothing. Schedule
+        each send on the running loop instead; failures drop the subscriber.
+        """
+        if not self.subscribers:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop (e.g. offline/unit use) — nothing to push to
+        data = json.dumps(rec)
+        for ws in list(self.subscribers):
+            if ws.closed:
+                self.subscribers.discard(ws)
+                continue
+            loop.create_task(self._send_or_drop(ws, data))
+
+    async def _send_or_drop(self, ws, data):
+        try:
+            await ws.send_str(data)
+        except Exception as e:
+            log("WARN", f"ws broadcast failed, dropping subscriber: {e}")
+            self.subscribers.discard(ws)
+
+    def authorized(self, request):
+        """Shared-token check for ingest (config: ingest_token).
+
+        The token was documented in config.example.yaml but never checked,
+        so setting it gave a false sense of protection. Empty token = open
+        (backwards compatible). Nodes send header X-Mosaic-Token; WebSocket
+        clients that cannot set headers may use ?token=.
+        """
+        if not self.ingest_token:
+            return True
+        supplied = request.headers.get("X-Mosaic-Token") or request.query.get("token", "")
+        return hmac.compare_digest(supplied.encode(), self.ingest_token.encode())
 
     # -- HTTP handlers ------------------------------------------------------
 
     async def handle_ingest(self, request):
+        if not self.authorized(request):
+            log("WARN", f"ingest {request.remote or '?'} unauthorized -> 401")
+            return web.json_response({"error": "unauthorized"}, status=401)
         # Read raw body FIRST so a JSON parse failure is diagnosable.
         # Before this, a bad_json rejection logged only the source IP — no
         # type, no payload excerpt, no parse error — making it impossible to
@@ -487,6 +527,9 @@ class Gateway:
         })
 
     async def handle_ws(self, request):
+        if not self.authorized(request):
+            log("WARN", f"[ws] {request.remote or '?'} unauthorized -> 401")
+            return web.json_response({"error": "unauthorized"}, status=401)
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         self.subscribers.add(ws)

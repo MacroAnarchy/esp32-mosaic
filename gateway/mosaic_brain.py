@@ -347,8 +347,12 @@ def robust_spread(vals):
         return max(vals) - min(vals)
     s = sorted(vals)
     n = len(s)
-    lo = s[max(0, int(n * 0.10) - 1)]
-    hi = s[min(n - 1, int(n * 0.90) - 1)]
+    # Nearest-rank percentiles: index ceil(p*n)-1. int() (floor) put p10 on
+    # the very minimum for 10-19 samples, so a single deep fade was NOT
+    # trimmed — the exact case this function exists for. Identical to the
+    # old indices whenever n is a multiple of 10.
+    lo = s[max(0, math.ceil(n * 0.10) - 1)]
+    hi = s[min(n - 1, math.ceil(n * 0.90) - 1)]
     return hi - lo
 
 
